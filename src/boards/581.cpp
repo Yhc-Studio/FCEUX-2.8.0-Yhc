@@ -24,12 +24,7 @@
 static void sync() {
 	int prg = Latch_address >> 1 & 0x20 | Latch_address & 0x1F;
 	if (Latch_address & 0x20) {
-		if (Latch_address & 0x01) {
-			setprg16(0x8000, prg);
-			setprg16(0xC000, prg);
-		}
-		else
-			setprg32(0x8000, prg >> 1);
+		setprg32(0x8000, prg >> 1);
 	}
 	else {
 		setprg16(0x8000, prg);
@@ -40,7 +35,7 @@ static void sync() {
 	setmirror(Latch_address & 0x80 ? MI_H : MI_V);
 }
 
-static void trapLatchWrite(uint16* newAddress, uint8* newValue, uint8 romValue) { /* The upper two address bits are only updated on a falling edge of A5. */
+static void trapLatchWrite(uint16_t* newAddress, uint8_t* newValue, uint8_t romValue) { /* The upper two address bits are only updated on a falling edge of A5. */
 	if (!(Latch_address & 0x20 && ~*newAddress & 0x20)) *newAddress = *newAddress & ~0xC0 | Latch_address & 0xC0;
 }
 

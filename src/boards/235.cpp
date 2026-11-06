@@ -2,6 +2,7 @@
  *
  * Copyright notice for this file:
  *  Copyright (C) 2005 CaH4e3
+ *  Copyright (C) 2020
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -19,79 +20,74 @@
  */
 
 #include "mapinc.h"
-#include "ines.h"
 
-static uint16 cmdreg = 0;
-static uint8 openbus = 0;
+static uint8_t submapper;
+static uint16_t cmdreg;
+static uint8_t unrom, reg, openbus;
 
-// For carts with extra 128K prg rom (Contra)
-static uint8 unrom = 0;
-static uint8 unromData = 0;
-
-static uint32 PRGROMSize = 0;
+static uint32_t PRGROMSize;
 
 static SFORMAT StateRegs[] =
 {
-	{ &cmdreg, 2, "CREG" },
-	{ &openbus, 1, "OB" },
-	{ &unrom, 1, "UROM" },
-	{ &unromData, 1, "UDTA" },
+	{ &cmdreg,  2 | FCEUSTATE_RLSB, "CREG" },
+	{ &unrom,   1, "UNRM" },
+	{ &reg,     1, "UNRG" },
+	{ &openbus, 1, "OPNB" },
 	{ 0 }
 };
 
 static void Sync(void) {
 	if (unrom) {
-		int PRGPageCount = PRGROMSize / (16 * 1024);
-		setprg16(0x8000, PRGPageCount & 0xC0 | (unromData & 7));
-		setprg16(0xC000, PRGPageCount & 0xC0 | 7);
+		uint8_t PRGPageSize = PRGROMSize / 16384;
+		setprg16(0x8000, (PRGPageSize & 0xC0) | (reg & 7));
+		setprg16(0xC000, (PRGPageSize & 0xC0) | 7);
+		setchr8(0);
 		setmirror(MI_V);
-	} else {
-		uint8 bank = ((cmdreg & 0x300) >> 3) | (cmdreg & 0x1F);
-		if (bank >= (PRGROMSize / (32 * 1024))) {
-			openbus = 1;
-		} else {
-			if (cmdreg & 0x400)
-				setmirror(MI_0);
-			else
-				setmirror(((cmdreg >> 13) & 1) ^ 1);
-		 	if (cmdreg & 0x800) {
-				setprg16(0x8000, (bank << 1) | ((cmdreg >> 12) & 1));
-				setprg16(0xC000, (bank << 1) | ((cmdreg >> 12) & 1));
-			} else
-				setprg32(0x8000, bank);
+	}
+	else {
+		uint8_t bank = ((cmdreg & 0x300) >> 3) | (cmdreg & 0x1F);
+		if (cmdreg & 0x400)
+			setmirror(MI_0);
+		else
+			setmirror(((cmdreg >> 13) & 1) ^ 1);
+		openbus = bank >= PRGROMSize / 32768;
+		if (cmdreg & 0x800) {
+			setprg16(0x8000, (bank << 1) | ((cmdreg >> 12) & 1));
+			setprg16(0xC000, (bank << 1) | ((cmdreg >> 12) & 1));
 		}
+		else
+			setprg32(0x8000, bank);
+		if (submapper == 1 && (bank & 0x18) == 0x18) setprg16(0xC000, (bank << 1 | cmdreg >> 12 & 1) & ~7);
+		setchr8(0);
 	}
 }
 
 static DECLFR(M235Read) {
-	if (openbus) {
-		openbus = 0;
+	if (openbus)
 		return X.DB;
-	}
-	return CartBR(A);
+	else
+		return CartBR(A);
 }
 
 static DECLFW(M235Write) {
 	cmdreg = A;
-	unromData = V;
+	reg = V;
 	Sync();
 }
 
 static void M235Reset(void) {
 	cmdreg = 0;
-	unromData = 0;
+	reg = 0;
 	if (PRGROMSize & 0x20000)
 		unrom = (unrom + 1) & 1;
 	Sync();
 }
 
 static void M235Power(void) {
-	setchr8(0);
 	SetWriteHandler(0x8000, 0xFFFF, M235Write);
 	SetReadHandler(0x8000, 0xFFFF, M235Read);
 	cmdreg = 0;
-	unromData = 0;
-	unrom = 0;
+	reg = 0;
 	Sync();
 }
 
@@ -99,12 +95,11 @@ static void M235Restore(int version) {
 	Sync();
 }
 
-void Mapper235_Init(CartInfo *info) {
+void Mapper235_Init(CartInfo* info) {
+	submapper = info->submapper;
 	info->Reset = M235Reset;
 	info->Power = M235Power;
 	GameStateRestore = M235Restore;
 	AddExState(&StateRegs, ~0, 0, 0);
-
-	// needs raw, non-pow2 PRGROM size for comparison
-	PRGROMSize = head.ROM_size * 16384;
+	PRGROMSize = info->PRGRomSize;
 }

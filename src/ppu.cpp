@@ -1429,30 +1429,36 @@ static void DoLine(void) {
 	if (SpriteON)
 		CopySprites(target);
 
-	//greyscale handling (mask some bits off the color) ? ? ?
-	if (ScreenON || SpriteON)
-	{
-		if (GRAYSCALE) {
-			for (x = 63; x >= 0; x--)
-				*(uint32*)&target[x << 2] = (*(uint32*)&target[x << 2]) & 0x30303030;
+	// Stage 3.6.6c v1.1: keep the successful DoLine merged post-process.
+	const uint8 stage366cVisualMask = PPUMASK_VISUAL;
+	const uint8 stage366cDeemph = stage366cVisualMask >> 5;
+	const uint32 stage366cDeemphWord = (uint32)stage366cDeemph * 0x01010101U;
+
+	// greyscale handling (same ordering as before)
+	if ((ScreenON || SpriteON) && (stage366cVisualMask & 0x01)) {
+		for (x = 63; x >= 0; x--)
+			*(uint32*)&target[x << 2] &= 0x30303030;
+	}
+
+	// Apply palette emphasis and write XDBuf in the same 64-dword pass.
+	if (stage366cDeemph == 0x7) {
+		for (x = 63; x >= 0; x--) {
+			*(uint32*)&target[x << 2] = ((*(uint32*)&target[x << 2]) & 0x3f3f3f3f) | 0xc0c0c0c0;
+			*(uint32*)&dtarget[x << 2] = stage366cDeemphWord;
 		}
 	}
-
-	//some pathetic attempts at deemph
-	if ((PPUMASK_VISUAL >> 5) == 0x7) {
-		for (x = 63; x >= 0; x--)
-			*(uint32*)&target[x << 2] = ((*(uint32*)&target[x << 2]) & 0x3f3f3f3f) | 0xc0c0c0c0;
+	else if (stage366cVisualMask & 0xE0) {
+		for (x = 63; x >= 0; x--) {
+			*(uint32*)&target[x << 2] |= 0x40404040;
+			*(uint32*)&dtarget[x << 2] = stage366cDeemphWord;
+		}
 	}
-	else if (PPUMASK_VISUAL & 0xE0)
-		for (x = 63; x >= 0; x--)
-			*(uint32*)&target[x << 2] = (*(uint32*)&target[x << 2]) | 0x40404040;
-	else
-		for (x = 63; x >= 0; x--)
+	else {
+		for (x = 63; x >= 0; x--) {
 			*(uint32*)&target[x << 2] = ((*(uint32*)&target[x << 2]) & 0x3f3f3f3f) | 0x80808080;
-
-	//write the actual deemph
-	for (x = 63; x >= 0; x--)
-		*(uint32*)&dtarget[x << 2] = ((PPUMASK_VISUAL >> 5) << 0) | ((PPUMASK_VISUAL >> 5) << 8) | ((PPUMASK_VISUAL >> 5) << 16) | ((PPUMASK_VISUAL >> 5) << 24);
+			*(uint32*)&dtarget[x << 2] = stage366cDeemphWord;
+		}
+	}
 
 	sphitx = 0x100;
 

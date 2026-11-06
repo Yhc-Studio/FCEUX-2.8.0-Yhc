@@ -16,7 +16,7 @@
 //extern volatile int userpause; //mbg merge 7/18/06 removed for merging
 extern HWND hDebug;
 
-extern int childwnd,numWPs; //mbg merge 7/18/06 had to make extern
+extern int childwnd, numWPs; //mbg merge 7/18/06 had to make extern
 extern bool debuggerAutoload;
 extern bool debuggerSaveLoadDEBFiles;
 extern bool debuggerDisplayROMoffsets;
@@ -29,7 +29,7 @@ extern unsigned int hexeditorFontHeight;
 extern char* hexeditorFontName;
 
 void CenterWindow(HWND hwndDlg);
-void DoPatcher(int address,HWND hParent);
+void DoPatcher(int address, HWND hParent);
 void UpdatePatcher(HWND hwndDlg);
 int GetEditHex(HWND hwndDlg, int id);
 
@@ -51,7 +51,7 @@ extern class DebugSystem {
 public:
 	DebugSystem();
 	~DebugSystem();
-	
+
 	void init();
 
 	HFONT hFixedFont;
@@ -144,12 +144,12 @@ _OP(DbgRts,    187,  80,  93)      /* Imayou */
 #define DCLRGB(name, r, g, b) CNRGB( , name, , , , , _COMMA)
 #define CMPRGB(name, r, g, b) (CNRGB( , name, !=, r, g, b, ||))
 
-#define SBCF(name) SBT(name, ChFmt)
+#define SBCF(name, ...) SBT(name, ChFmt)
 #define PPCF(name) &SBCF(name)
 #define PPCCF(name) PPRGB(name), PPCF(name)
 #define DEFCF(name, r, g, b) (DEFRGB(name, r, g, b), SBCF(name).crTextColor = RGB(r, g, b))
 #define CMPCF(name, r, g, b) (CNRGB( , name, !=, r, g, b, ||) || SBCF(name).crTextColor != RGB(r, g, b))
-#define INITCF(name)                        \
+#define INITCF(name, ...)                   \
 (memset(PPCF(name), 0, sizeof(SBCF(name))), \
 SBCF(name).cbSize = sizeof(SBCF(name)),     \
 SBCF(name).dwMask = CFM_COLOR,              \

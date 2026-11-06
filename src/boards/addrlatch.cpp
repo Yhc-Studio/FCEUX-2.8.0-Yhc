@@ -342,16 +342,43 @@ void Mapper202_Init(CartInfo *info) {
 //------------------ Map 204 ---------------------------
 
 static void M204Sync(void) {
-	int32 tmp2 = latche & 0x6;
-	int32 tmp1 = tmp2 + ((tmp2 == 0x6) ? 0 : (latche & 1));
+	int32_t tmp2 = latche & 0x6;
+	int32_t tmp1 = tmp2 + ((tmp2 == 0x6) ? 0 : (latche & 1));
 	setprg16(0x8000, tmp1);
 	setprg16(0xc000, tmp2 + ((tmp2 == 0x6) ? 1 : (latche & 1)));
 	setchr8(tmp1);
 	setmirror(((latche >> 4) & 1) ^ 1);
 }
 
-void Mapper204_Init(CartInfo *info) {
+static DECLFR(Mapper204_interceptPRGRead_small) {
+	return latche & 4 && dipswitch & 1 || latche & 8 && dipswitch & 2 ? X.DB : CartBR(A);
+}
+
+static DECLFR(Mapper204_interceptPRGRead_large) {
+	if (A & 0xF)
+		return latche & 8 && dipswitch & 1 ? X.DB : CartBR(A);
+	else
+		return latche & 8 ? CartBR(A & ~0x1F | dipswitch & 0x1F) : CartBR(A);
+}
+
+static void Mapper204_Power() {
+	LatchPower();
+	dipswitch = 0;
+	SetReadHandler(0x8000, 0xFFFF, ROM_size == 4 ? Mapper204_interceptPRGRead_small : Mapper204_interceptPRGRead_large);
+	M204Sync();
+}
+
+static void Mapper204_Reset() {
+	latche = 0;
+	dipswitch++;
+	M204Sync();
+}
+
+void Mapper204_Init(CartInfo* info) {
 	Latch_Init(info, M204Sync, NULL, 0xFFFF, 0x8000, 0xFFFF, 0);
+	info->Power = Mapper204_Power;
+	info->Reset = Mapper204_Reset;
+	AddExState(&dipswitch, 1, 0, "DIPSW");
 }
 
 //------------------ Map 212 ---------------------------
@@ -1062,23 +1089,4 @@ static void M731Sync(void) {
 
 void Mapper731_Init(CartInfo* info) {
 	Latch_Init(info, M731Sync, NULL, 0x0000, 0x8000, 0xFFFF, 0);
-}
-
-/*------------------ Map 626 ---------------------------*/
-static void M626Sync(void) {
-	if (latche & 0x200)
-		setprg32(0x8000, latche);
-	else {
-		setprg16(0x8000, latche << 1 | latche >> 8 & 1);
-		setprg16(0xC000, latche << 1 | latche >> 8 & 1);
-	}
-	setchr8(0);
-	if (latche & 0x80)
-		setmirror(MI_H);
-	else
-		setmirror(MI_V);
-}
-
-void Mapper626_Init(CartInfo* info) {
-	Latch_Init(info, M626Sync, NULL, 0x0000, 0x8000, 0xFFFF, 0);
 }

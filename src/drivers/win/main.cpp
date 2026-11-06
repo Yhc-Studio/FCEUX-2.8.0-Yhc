@@ -139,9 +139,13 @@ extern int32 fps_scale_unpaused;
 
 // Manual high-speed fast-forward starts at 3200% (8192 / 256 = 32x).
 // AVI recording is deliberately excluded so frame/audio dumping stays deterministic.
-static const int32 WIN_MANUAL_FAST_FORWARD_THRESHOLD = 8192;
-static const int WIN_MANUAL_FAST_FORWARD_SKIP_AMT = 3; // display 1 frame, skip 3 video frames
-static const int WIN_FAST_WINDOW_UPDATE_MASK = 7;       // update heavy tool windows every 8 frames
+// Stage 3.6.6d: keep 3200% as a timed 32x mode and unlock a real 6400%/64x mode.
+static const int32 WIN_MANUAL_FAST_FORWARD_THRESHOLD = 8192;  // 3200% = 32x
+static const int32 WIN_MANUAL_6400_THRESHOLD = 16384;          // 6400% = 64x
+static const int WIN_MANUAL_FAST_FORWARD_SKIP_3200 = 3;      // render 1 / emulate 4
+static const int WIN_MANUAL_FAST_FORWARD_SKIP_6400 = 7;      // render 1 / emulate 8
+static const int WIN_FAST_WINDOW_UPDATE_MASK_3200 = 7;       // heavy tools every 8 frames
+static const int WIN_FAST_WINDOW_UPDATE_MASK_6400 = 15;      // heavy tools every 16 frames
 
 static inline bool WinAviDumpSafeMode()
 {
@@ -153,6 +157,16 @@ static inline bool WinManualFastForwardMode()
 	return (!WinAviDumpSafeMode() && fps_scale_unpaused >= WIN_MANUAL_FAST_FORWARD_THRESHOLD);
 }
 
+static inline bool WinManual6400Mode()
+{
+	return (!WinAviDumpSafeMode() && fps_scale_unpaused >= WIN_MANUAL_6400_THRESHOLD);
+}
+
+static inline int WinManualFastForwardSkipAmount()
+{
+	return WinManual6400Mode() ? WIN_MANUAL_FAST_FORWARD_SKIP_6400 : WIN_MANUAL_FAST_FORWARD_SKIP_3200;
+}
+
 
 
 static bool WinShouldUpdateHeavyToolWindows()
@@ -161,7 +175,10 @@ static bool WinShouldUpdateHeavyToolWindows()
 		return true;
 
 	static unsigned int fastUpdateCounter = 0;
-	return ((fastUpdateCounter++ & WIN_FAST_WINDOW_UPDATE_MASK) == 0);
+	const unsigned int updateMask = WinManual6400Mode()
+		? WIN_FAST_WINDOW_UPDATE_MASK_6400
+		: WIN_FAST_WINDOW_UPDATE_MASK_3200;
+	return ((fastUpdateCounter++ & updateMask) == 0);
 }
 
 // Internal variables
@@ -174,6 +191,38 @@ int soundoptions = SO_SECONDARY | SO_GFOCUS;
 int soundrate = 48000;
 int soundbuftime = 50;
 int soundquality = 1;
+
+// Stage 3.6.6e v1: keep 3200%/6400% audible without paying the full HQ audio cost.
+// This reuses FCEUX's existing Turbo behavior: high-speed playback uses quality 0.
+// AVI recording always wins and restores the configured user quality before emulation.
+static void WinUpdateHighSpeedSoundQuality(bool aviDumpSafeMode, bool manualFastForward)
+{
+    static int lastDesiredQuality = -1;
+    static int lastUserQuality = -1;
+    static int lastTurboState = -1;
+    static int lastAviState = -1;
+    static int lastManualState = -1;
+
+    const int desiredQuality = aviDumpSafeMode ? soundquality : ((turbo || manualFastForward) ? 0 : soundquality);
+    const int turboState = turbo ? 1 : 0;
+    const int aviState = aviDumpSafeMode ? 1 : 0;
+    const int manualState = manualFastForward ? 1 : 0;
+
+    if (desiredQuality != lastDesiredQuality ||
+        soundquality != lastUserQuality ||
+        turboState != lastTurboState ||
+        aviState != lastAviState ||
+        manualState != lastManualState)
+    {
+        FCEUI_SetSoundQuality(desiredQuality);
+        lastDesiredQuality = desiredQuality;
+        lastUserQuality = soundquality;
+        lastTurboState = turboState;
+        lastAviState = aviState;
+        lastManualState = manualState;
+    }
+}
+
 
 //Sound volume controls (range 0-150 by 10's)j-----
 int soundvolume = 150;			//Master sound volume
@@ -965,6 +1014,8 @@ doloopy:
 			int32 ssize = 0; ///contains sound samples count
 
 			const bool aviDumpSafeMode = WinAviDumpSafeMode();
+			const bool manualFastForward = WinManualFastForwardMode();
+			WinUpdateHighSpeedSoundQuality(aviDumpSafeMode, manualFastForward);
 			if (aviDumpSafeMode)
 			{
 				// AVI recording must never inherit turbo/manual/Lua frame skipping.
@@ -986,18 +1037,19 @@ doloopy:
 				}
 
 			}
-			else if (WinManualFastForwardMode())
+			else if (manualFastForward)
 			{
 				// 3200% and 6400% are treated as fast-forward modes.
 				// Skip video only, not sound, so this is safer than mute-turbo.
 				if (!fastForwardFrameSkipCounter)
 				{
-					fastForwardFrameSkipCounter = WIN_MANUAL_FAST_FORWARD_SKIP_AMT;
+					fastForwardFrameSkipCounter = WinManualFastForwardSkipAmount();
 					skippy = 0;
 				}
 				else
 				{
 					fastForwardFrameSkipCounter--;
+					// Stage 3.6.6e v1: manual 3200%/6400% skips video only; audio remains continuous.
 					skippy = 1;
 				}
 			}
@@ -1130,6 +1182,7 @@ void FCEUD_Update(uint8* XBuf, int32* Buffer, int Count)
 
 	//write all the sound we generated.
 	// AVI recording must not inherit mute-turbo's sound bypass, or A/V sync can break.
+	// Stage 3.6.6e v1: manual 3200%/6400% keeps audible DirectSound output.
 	if (soundo && Buffer && Count && !muteTurboSoundBypass) {
 		win_SoundWriteData(Buffer, Count); //If turboing and mute turbo is true, bypass this
 	}
@@ -1155,16 +1208,17 @@ void FCEUD_Update(uint8* XBuf, int32* Buffer, int Count)
 		if (!soundo) throttle = false;
 	}
 
-	if (throttle)  //if throttling is enabled..
-		if (!turbo && !manualFastForward) //turbo and manual 3200%/6400% fast-forward run without SpeedThrottle waits
-			if (!FCEUI_EmulationPaused()
-				|| JustFrameAdvanced
-				)
-				//then throttle
-				while (SpeedThrottle()) {
-					FCEUD_UpdateInput();
-					_updateWindow();
-				}
+	// Stage 3.6.6d v1.1: manual 3200%/6400% are timed speed presets, not unlimited turbo.
+	// Force their timer even when EO_NOTHROTTLE would disable ordinary throttling.
+	// TAB Turbo remains the only unlimited path.
+	if (!turbo && (manualFastForward || throttle))
+		if (!FCEUI_EmulationPaused()
+			|| JustFrameAdvanced
+			)
+			while (SpeedThrottle()) {
+				FCEUD_UpdateInput();
+				_updateWindow();
+			}
 
 
 	//sleep just to be polite

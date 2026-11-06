@@ -162,9 +162,11 @@ void SetupCartCHRMapping(int chip, uint8 *p, uint32 size, int ram) {
 	CHRram[chip] = ram;
 }
 
+// Stage 3.6.6c v1.1: CartBR x64-safe direct page read.
+// Same semantics as FCEU_GetPageAddress(), but keeps this extremely hot handler flat.
 DECLFR(CartBR) {
-	uint8* p = FCEU_GetPageAddress(A);
-	return p ? *p : X.DB;
+	uint8* base = Page[A >> 11];
+	return base ? *(uint8*)((uintptr_t)base + (uintptr_t)A) : X.DB;
 }
 
 DECLFW(CartBW) {

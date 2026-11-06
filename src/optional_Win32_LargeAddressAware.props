@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!-- Optional for 32-bit FCEUX builds that need very large (256-512 MiB) ROMs.
+       On 64-bit Windows this allows a Large-Address-Aware 32-bit process to use
+       up to 4 GiB of user virtual address space instead of the traditional 2 GiB.
+       x64 builds do not need this property sheet. -->
+  <ItemDefinitionGroup Condition="'$(Platform)'=='Win32'">
+    <Link>
+      <LargeAddressAware>true</LargeAddressAware>
+    </Link>
+  </ItemDefinitionGroup>
+</Project>

@@ -23,25 +23,30 @@
 #include "mapinc.h"
 #include "asic_mmc3.h"
 
-static uint8 reg;
-static uint8 pad;
-
-static DECLFR(readPad) {
-	return CartBR(A & ~0xF | pad & 0xF);
-}
+static uint8_t submapper;
+static uint8_t reg;
+static uint8_t pad;
 
 static void sync() {
-	int prgAND = reg & 0x20 ? 0x1F : 0x0F;
-	int chrAND = reg & 0x20 ? 0xFF : 0x7F;
-	int prgOR = reg << 1;
-	int chrOR = reg << 4;
+	int prgAND, chrAND, prgOR, chrOR;
+	if (submapper == 1) {
+		prgAND = 0x0F;
+		chrAND = 0x7F;
+		prgOR = reg & 0x20 | reg << 1 & 0x10;
+		chrOR = reg << 3 & 0x180;
+	}
+	else {
+		prgAND = reg & 0x20 ? 0x1F : 0x0F;
+		chrAND = reg & 0x20 ? 0xFF : 0x7F;
+		prgOR = reg << 1;
+		chrOR = reg << 4;
+	}
 	MMC3_syncPRG(prgAND, prgOR & ~prgAND);
 	MMC3_syncCHR(chrAND, chrOR & ~chrAND);
 	MMC3_syncMirror();
-	SetReadHandler(0x8000, 0xFFFF, reg & 0x40 ? readPad : CartBR);
 }
 
-static int getPRGBank(uint8 bank) {
+static int getPRGBank(uint8_t bank) {
 	if (reg & 0x02) {
 		int mask = reg & 0x01 ? 3 : 1;
 		return MMC3_getPRGBank(0) & ~mask | bank & mask;
@@ -55,6 +60,14 @@ static DECLFW(writeReg) {
 	sync();
 }
 
+static DECLFR(interceptPRGRead0) {
+	return reg & 0x40 ? CartBR(A & ~0xF | pad & 0xF) : CartBR(A);
+}
+
+static DECLFR(interceptPRGRead1) {
+	return reg & 0x40 && pad & 1 || reg & 0x80 && pad & 2 ? X.DB : CartBR(A);
+}
+
 static void reset() {
 	reg = 0;
 	pad++;
@@ -65,9 +78,11 @@ static void power() {
 	reg = 0;
 	pad = 0;
 	MMC3_power();
+	SetReadHandler(0x8000, 0xFFFF, submapper == 1 ? interceptPRGRead1 : interceptPRGRead0);
 }
 
 void Mapper568_Init(CartInfo* info) {
+	submapper = info->submapper;
 	MMC3_init(info, sync, MMC3_TYPE_AX5202P, getPRGBank, NULL, NULL, writeReg);
 	info->Power = power;
 	info->Reset = reset;

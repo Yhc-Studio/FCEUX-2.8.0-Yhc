@@ -19,6 +19,7 @@
  */
 
 #include "mapinc.h"
+#include "asic_fme7.h"
 #include "asic_h3001.h"
 #include "asic_latch.h"
 #include "asic_mmc1.h"
@@ -35,10 +36,10 @@
 #include "flashrom.h"
 #include "cartram.h"
 
-static uint8 submapper;
-static uint8 reg[8];
+static uint8_t submapper;
+static uint8_t reg[8];
 static void (*mapperSync)(int, int, int, int) = NULL;
-static void applyMode(uint8);
+static void applyMode(uint8_t);
 
 static void sync() {
 	int prgAND = reg[3] ^ (submapper == 2 ? 0x00 : 0xFF);
@@ -97,6 +98,12 @@ static void sync_CNROM_Konami(int prgAND, int prgOR, int chrAND, int chrOR) {
 	setprg8(0xE000, 3 & prgAND | prgOR);
 	setchr8(Latch_data << 1 & 2 | Latch_data >> 1 & 1);
 	setmirror(reg[4] & 0x01 ? MI_V : MI_H);
+}
+
+static void sync_FME7(int prgAND, int prgOR, int chrAND, int chrOR) {
+	FME7_syncPRG(prgAND, prgOR & ~prgAND);
+	FME7_syncCHR(chrAND, chrOR & ~chrAND);
+	FME7_syncMirror();
 }
 
 static void sync_GNROM(int prgAND, int prgOR, int chrAND, int chrOR) {
@@ -244,11 +251,11 @@ static DECLFW(writeFlash) {
 	flashrom_write(A & 0x1FFF | (Page[A >> 11] + A - PRGptr[0]) & ~0x1FFF, V);
 }
 
-static int SUROM_getPRGBank(uint8 bank) {
+static int SUROM_getPRGBank(uint8_t bank) {
 	return MMC1_getPRGBank(bank) | MMC1_getCHRBank(0) & 0x10;
 }
 
-static int Mapper22_getCHRBank(uint8 bank) {
+static int Mapper22_getCHRBank(uint8_t bank) {
 	return VRC24_getCHRBank(bank & 7) >> 1;
 }
 
@@ -260,7 +267,7 @@ static DECLFW(writeReg) {
 		sync();
 }
 
-static void applyMode(uint8 clear) {
+static void applyMode(uint8_t clear) {
 	if (reg[0] & 0x80) {
 		SetWriteHandler(0x5000, 0x5FFF, CartBW);
 		switch (submapper << 8 | reg[0] & 0x1F) {
@@ -373,6 +380,10 @@ static void applyMode(uint8 clear) {
 			mapperSync = sync_TC3294;
 			TC3294_activate(clear, sync);
 			break;
+		case 0x402:
+			mapperSync = sync_FME7;
+			FME7_activate(clear, sync);
+			break;
 		default:
 			break;
 		}
@@ -393,6 +404,7 @@ static void power() {
 	reg[0] = reg[1] = reg[2] = reg[3] = reg[4] = reg[5] = reg[6] = reg[7] = 0;
 	applyMode(1);
 	SetReadHandler(0x8000, 0xFFFF, CartBR);
+	if (PRGsize[0x10]) FCEU_CheatAddRAM((PRGsize[0x10] >> 10) < 8 ? (PRGsize[0x10] >> 10) : 8, 0x6000, PRGptr[0x10]);
 }
 
 static void stateRestore(int version) {
@@ -414,6 +426,7 @@ void Mapper446_Init(CartInfo* info) {
 	QJ_addExState();
 	PT8154_addExState();
 	TC3294_addExState();
+	FME7_addExState();
 	WRAM_init(info, 32);
 	flashrom_init(0x01, 0x7E, 131072, 0xAAA, 0x555, 0xFFF);
 	info->Reset = power;

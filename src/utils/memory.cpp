@@ -85,6 +85,14 @@ void *FCEU_malloc(size_t size)
 	return ret;
 }
 
+void *FCEU_malloc_uninitialized(size_t size)
+{
+	// ROM/CHR loader buffers are overwritten by file data and explicitly pad
+	// any unread tail. Skipping the legacy zero-fill avoids an otherwise
+	// redundant 64-512 MiB memory pass on very large multicart images.
+	return _FCEU_malloc(size);
+}
+
 void FCEU_gfree(void *ptr)
 {
 	_FCEU_free(ptr);

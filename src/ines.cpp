@@ -42,6 +42,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
+#include <condition_variable>
+#include <mutex>
+#include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <bcrypt.h>
+#endif
 
 extern SFORMAT FCEUVSUNI_STATEINFO[];
 
@@ -70,6 +82,158 @@ static int iNES_Init(int num);
 static int MapperNo = 0;
 
 int iNES2 = 0;
+
+#ifdef _WIN32
+// Stage 3.6.6i v2.2: use Windows CNG's optimized streaming MD5 when
+// available.  Resolve bcrypt.dll dynamically so the existing VS project does
+// not need an added bcrypt.lib dependency.  Any failure falls back to FCEUX's
+// original MD5 implementation.
+class FCEUWinCngMD5 {
+public:
+	FCEUWinCngMD5()
+		: module(NULL), alg(NULL), hash(NULL), initialized(false), finished(false),
+		  pOpen(NULL), pGetProperty(NULL), pCreate(NULL), pHashData(NULL),
+		  pFinish(NULL), pDestroy(NULL), pClose(NULL) {}
+
+	~FCEUWinCngMD5() { cleanup(); }
+
+	bool init() {
+		cleanup();
+		module = LoadLibraryW(L"bcrypt.dll");
+		if (!module) return false;
+
+		pOpen = reinterpret_cast<PFN_Open>(GetProcAddress(module, "BCryptOpenAlgorithmProvider"));
+		pGetProperty = reinterpret_cast<PFN_GetProperty>(GetProcAddress(module, "BCryptGetProperty"));
+		pCreate = reinterpret_cast<PFN_Create>(GetProcAddress(module, "BCryptCreateHash"));
+		pHashData = reinterpret_cast<PFN_HashData>(GetProcAddress(module, "BCryptHashData"));
+		pFinish = reinterpret_cast<PFN_Finish>(GetProcAddress(module, "BCryptFinishHash"));
+		pDestroy = reinterpret_cast<PFN_Destroy>(GetProcAddress(module, "BCryptDestroyHash"));
+		pClose = reinterpret_cast<PFN_Close>(GetProcAddress(module, "BCryptCloseAlgorithmProvider"));
+		if (!pOpen || !pGetProperty || !pCreate || !pHashData || !pFinish || !pDestroy || !pClose) {
+			cleanup();
+			return false;
+		}
+
+		if (pOpen(&alg, BCRYPT_MD5_ALGORITHM, NULL, 0) < 0) {
+			cleanup();
+			return false;
+		}
+
+		ULONG objectLength = 0, hashLength = 0, resultLength = 0;
+		if (pGetProperty(alg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objectLength),
+				sizeof(objectLength), &resultLength, 0) < 0 || objectLength == 0 ||
+			pGetProperty(alg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hashLength),
+				sizeof(hashLength), &resultLength, 0) < 0 || hashLength != 16) {
+			cleanup();
+			return false;
+		}
+
+		object.resize(objectLength);
+		if (pCreate(alg, &hash, object.data(), objectLength, NULL, 0, 0) < 0) {
+			cleanup();
+			return false;
+		}
+
+		initialized = true;
+		finished = false;
+		return true;
+	}
+
+	bool update(const uint8* data, uint32 length) {
+		if (!initialized || finished || !length) return initialized && !finished;
+		return pHashData(hash, const_cast<PUCHAR>(reinterpret_cast<const UCHAR*>(data)), length, 0) >= 0;
+	}
+
+	bool finish(uint8 digest[16]) {
+		if (!initialized || finished) return false;
+		if (pFinish(hash, digest, 16, 0) < 0) return false;
+		finished = true;
+		return true;
+	}
+
+private:
+	typedef NTSTATUS (WINAPI *PFN_Open)(BCRYPT_ALG_HANDLE*, LPCWSTR, LPCWSTR, ULONG);
+	typedef NTSTATUS (WINAPI *PFN_GetProperty)(BCRYPT_HANDLE, LPCWSTR, PUCHAR, ULONG, ULONG*, ULONG);
+	typedef NTSTATUS (WINAPI *PFN_Create)(BCRYPT_ALG_HANDLE, BCRYPT_HASH_HANDLE*, PUCHAR, ULONG, PUCHAR, ULONG, ULONG);
+	typedef NTSTATUS (WINAPI *PFN_HashData)(BCRYPT_HASH_HANDLE, PUCHAR, ULONG, ULONG);
+	typedef NTSTATUS (WINAPI *PFN_Finish)(BCRYPT_HASH_HANDLE, PUCHAR, ULONG, ULONG);
+	typedef NTSTATUS (WINAPI *PFN_Destroy)(BCRYPT_HASH_HANDLE);
+	typedef NTSTATUS (WINAPI *PFN_Close)(BCRYPT_ALG_HANDLE, ULONG);
+
+	void cleanup() {
+		if (hash && pDestroy) pDestroy(hash);
+		hash = NULL;
+		if (alg && pClose) pClose(alg, 0);
+		alg = NULL;
+		object.clear();
+		initialized = false;
+		finished = false;
+		pOpen = NULL; pGetProperty = NULL; pCreate = NULL; pHashData = NULL;
+		pFinish = NULL; pDestroy = NULL; pClose = NULL;
+		if (module) FreeLibrary(module);
+		module = NULL;
+	}
+
+	HMODULE module;
+	BCRYPT_ALG_HANDLE alg;
+	BCRYPT_HASH_HANDLE hash;
+	std::vector<UCHAR> object;
+	bool initialized;
+	bool finished;
+	PFN_Open pOpen;
+	PFN_GetProperty pGetProperty;
+	PFN_Create pCreate;
+	PFN_HashData pHashData;
+	PFN_Finish pFinish;
+	PFN_Destroy pDestroy;
+	PFN_Close pClose;
+};
+#endif
+
+// Stage 3.6.6i v2.2: large ROM buffers use VirtualAlloc on Windows.  This
+// avoids putting 128-512 MiB allocations on the CRT heap and, importantly,
+// VirtualFree(MEM_RELEASE) returns the whole region to the OS immediately when
+// a ROM is closed or replaced.  Smaller buffers retain the normal allocator.
+static bool ROMUsesVirtualAlloc = false;
+static bool VROMUsesVirtualAlloc = false;
+static bool MiscROMUsesVirtualAlloc = false;
+
+static uint8* AllocateLargeROMBuffer(size_t size, bool& usesVirtualAlloc)
+{
+	usesVirtualAlloc = false;
+	if (!size)
+		return NULL;
+#ifdef _WIN32
+	const size_t virtualAllocThreshold = 64U * 1024U * 1024U;
+	if (size >= virtualAllocThreshold) {
+		void* p = VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+		if (p) {
+			usesVirtualAlloc = true;
+			return static_cast<uint8*>(p);
+		}
+	}
+#endif
+	return static_cast<uint8*>(FCEU_malloc_uninitialized(size));
+}
+
+static void FreeLargeROMBuffer(uint8*& ptr, bool& usesVirtualAlloc)
+{
+	if (!ptr) {
+		usesVirtualAlloc = false;
+		return;
+	}
+#ifdef _WIN32
+	if (usesVirtualAlloc) {
+		VirtualFree(ptr, 0, MEM_RELEASE);
+	}
+	else
+#endif
+	{
+		FCEU_free(ptr);
+	}
+	ptr = NULL;
+	usesVirtualAlloc = false;
+}
 
 static DECLFR(TrainerRead) {
 	return(trainerpoo[A & 0x1FF]);
@@ -112,18 +276,9 @@ void iNESGI(GI h) { //bbit edited: removed static keyword
 		FCEU_SaveGameSave(&iNESCart);
 		if (iNESCart.Close)
 			iNESCart.Close();
-		if (ROM) {
-			FCEU_free(ROM);
-			ROM = NULL;
-		}
-		if (VROM) {
-			FCEU_free(VROM);
-			VROM = NULL;
-		}
-		if (MiscROM) {
-			FCEU_free(MiscROM);
-			MiscROM = NULL;
-		}
+		FreeLargeROMBuffer(ROM, ROMUsesVirtualAlloc);
+		FreeLargeROMBuffer(VROM, VROMUsesVirtualAlloc);
+		FreeLargeROMBuffer(MiscROM, MiscROMUsesVirtualAlloc);
 		MiscROM_size = 0;
 		if (trainerpoo) {
 			free(trainerpoo);
@@ -359,56 +514,39 @@ static void CheckHInfo(uint64 partialmd5) {
 
 	static uint64 savie[] =
 	{
-		0x6922d92ce10967a8ULL,	/* AD&D Heroes of the Lance (J) */
-		0x4f46d1de7d0afba7ULL,	/* AD&D Heroes of the Lance (U) */
-		0x8c30921b9328f409ULL,	/* AD&D Hillsfar (J) */
-		0xb1c2df446373777bULL,	/* AD&D Hillsfar (U) */
-		0x3ca38a30f1ec4110ULL,	/* AD&D Pool of Radiance (J) */
-		0x859542620628afccULL,	/* AD&D Pool of Radiance (U) */
-		0xf3cb6e1a6022e503ULL,	/* Battle Fleet */
-		0xc8df134ce18a7d2fULL,	/* Downtown Special: Kunio-kun no Jidaigeki Dayo Zenin Shuugou! */
-		0xe8382f82570bc616ULL,	/* DW 1 (PRG0) */
-		0xe0413c76f69f5acaULL,	/* DW 1 (PRG1) */
-		0xccdb4563c9004d86ULL,	/* DW 2 */
-		0xb4b5416962ac800aULL,	/* DQ 3 (PRG0) */
-		0x5a0c984006b088c2ULL,	/* DQ 3 (PRG1) */
-		0x16a03048ce659d3dULL,	/* Dw 3 */
-		0x80d5683ac9553740ULL,	/* DQ 4 (PRG0) */
-		0x192f2997b7f5123eULL,	/* DQ 4 (PRG1) */
-		0xd8a1d610c93b96adULL,	/* Dw 4 (U) */
-		0xbf22d20bd7c5fc50ULL,	/* Famista '90 */
-		0x4f17d28ef72c5e2fULL,	/* Faria (J) */
-		0x7a01e068ab53e51bULL,	/* Faria (U) */
-		0x97a660fb70152637ULL,	/* Feng Shen Bang */
-		0x881ecc27f0d3b10eULL,	/* FF 1 (J) (PRG0) */
-		0x4dd4c6f2ff32da4dULL,	/* FF 1 (J) (PRG1) */
-		0x24ae5edf8375162fULL,	/* FF 1 (U) */
-		0x4b3342b2c143dadeULL,	/* FF 1+2 */
-		0x374ed97be8bfd628ULL,	/* FF 2 */
-		0x45a7d02ed0dc9266ULL,	/* FF 3 */
-		0x7155ba08492a466cULL,	/* Hydlide 3 */
-		0x8a60538025e37dbcULL,	/* Jing Ke Xin Zhuan */
-		0xc138b82de57f616cULL,	/* Justbreed */
-		0xc064782f5729f32eULL,	/* Kaijuu Monogatari */
-		0xb7843f2d0a4df4f5ULL,	/* Kyonshiizu 2 */
-		0xd9a1631d5c32d355ULL,	/* Legend of Zelda (PRG0) */
-		0xd3f453931146e95bULL,	/* Legend of Zelda (PRG1) */
-		0xb8b6caf3795468cbULL,	/* Legend of Zelda (J) */
-		0x7d98c75301dbcd72ULL,	/* Magical Taruruuto 1 (PRG0) */
-		0x4d46756da82fec49ULL,	/* Magical Taruruuto 1 (PRG1) */
-		0x88b3ab0e9aceb751ULL,	/* Magical Taruruuto 2 */
-		0xf2ef7e357127bfb0ULL,	/* Mindseeker */
-		0xc9329c7401ce9b8aULL,	/* Mirai Shinwa Jarvas */
-		0x2d9bc331e80cb239ULL,	/* Mouryou Senki Madara */
-		0x2391e4e11a70eed4ULL,	/* Ninjara Hoi! */
-		0x74a2aecb64165e71ULL,	/* RPG Jinsei Game */
-		0xb1eddbb71994db07ULL,	/* Startropics */
-		0x54a19f2911aa51ddULL,	/* Startropics 2 */
-		0xb8306e8dad7d0299ULL,	/* Taito Grand Prix */
-		0x41da606caba53bdeULL,	/* Ys 1 */
-		0xe5bee2f0beebd32bULL,	/* Ys 2 */
-		0x3f24ad48065c8c62ULL,	/* Ys 3 */
-		0x88c0493fb1146834ULL,	/* Zelda 2 */
+		0xc04361e499748382ULL,	/* AD&D Heroes of the Lance */
+		0xb72ee2337ced5792ULL,	/* AD&D Hillsfar */
+		0x2b7103b7a27bd72fULL,	/* AD&D Pool of Radiance */
+		0x498c10dc463cfe95ULL,	/* Battle Fleet */
+		0x854d7947a3177f57ULL,	/* Crystalis */
+		0xfad22d265cd70820ULL,	/* Downtown Special: Kunio-kun no Jidaigeki Dayo Zenin Shuugou! */
+		0x4a1f5336b86851b6ULL,	/* DW */
+		0xb0bcc02c843c1b79ULL,	/* DW */
+		0x2dcf3a98c7937c22ULL,	/* DW 2 */
+		0x98e55e09dfcc7533ULL,	/* DW 4*/
+		0x733026b6b72f2470ULL,	/* Dw 3 */
+		0x6917ffcaca2d8466ULL,	/* Famista '90 */
+		0x8da46db592a1fcf4ULL,	/* Faria */
+		0xedba17a2c4608d20ULL,	/* Final Fantasy */
+		0x91a6846d3202e3d6ULL,	/* Final Fantasy */
+		0x012df596e2b31174ULL,	/* Final Fantasy 1+2 */
+		0xf6b359a720549ecdULL,	/* Final Fantasy 2 */
+		0x5a30da1d9b4af35dULL,	/* Final Fantasy 3 */
+		0xd63dcc68c2b20adcULL,	/* Final Fantasy J */
+		0x2ee3417ba8b69706ULL,	/* Hydlide 3*/
+		0xebbce5a54cf3ecc0ULL,	/* Justbreed */
+		0x6a858da551ba239eULL,	/* Kaijuu Monogatari */
+		0x2db8f5d16c10b925ULL,	/* Kyonshiizu 2 */
+		0x04a31647de80fdabULL,	/* Legend of Zelda */
+		0x94b9484862a26cbaULL,	/* Legend of Zelda */
+		0xa40666740b7d22feULL,	/* Mindseeker */
+		0x82000965f04a71bbULL,	/* Mirai Shinwa Jarvas */
+		0x77b811b2760104b9ULL,	/* Mouryou Senki Madara */
+		0x11b69122efe86e8cULL,	/* RPG Jinsei Game */
+		0x9aa1dc16c05e7de5ULL,	/* Startropics */
+		0x1b084107d0878bd0ULL,	/* Startropics 2*/
+		0xa70b495314f4d075ULL,	/* Ys 3 */
+		0x836c0ff4f3e06e45ULL,	/* Zelda 2 */
 		0						/* Abandon all hope if the game has 0 in the lower 64-bits of its MD5 hash */
 	};
 
@@ -441,8 +579,7 @@ static void CheckHInfo(uint64 partialmd5) {
 			if (moo[x].mapper >= 0) {
 				if (moo[x].mapper & 0x800 && VROM_size) {
 					VROM_size = 0;
-					free(VROM);
-					VROM = NULL;
+					FreeLargeROMBuffer(VROM, VROMUsesVirtualAlloc);
 					tofix |= 8;
 				}
 				if (moo[x].mapper & 0x1000)
@@ -536,7 +673,7 @@ typedef struct {
 // to something more unified for ines 2.0 specific
 static int not_power2[] =
 {
-	23, 53, 195, 198, 228, 547
+	53, 198, 228, 547
 };
 
 BMAPPINGLocal bmap[] = {
@@ -595,7 +732,7 @@ BMAPPINGLocal bmap[] = {
 	{"MMC3 BMC PIRATE D",	 52, Mapper52_Init},
 	{"SUPERVISION 16-in-1",	 53, Supervision16_Init},
 //	{"",					 54, Mapper54_Init},
-	{ "NCN-35A",        55,  Mapper55_Init  },
+//	{"",					 55, Mapper55_Init},
 //	{"",					 56, Mapper56_Init},
 	{"SIMBPLE BMC PIRATE A", 57, Mapper57_Init},
 	{"SIMBPLE BMC PIRATE B", 58, BMCGK192_Init},
@@ -640,11 +777,11 @@ BMAPPINGLocal bmap[] = {
 	{"IREM TAM-S1",			 97, Mapper97_Init},
 //	{"",					 98, Mapper98_Init},
 	{"VS Uni/Dual- system",	 99, Mapper99_Init},
-	{ "Nesticle MMC3",		100, Mapper100_Init},
+//	{"",					100, Mapper100_Init},
 	{"",					101, Mapper101_Init},
 //	{"",					102, Mapper102_Init},
 	{"FDS DOKIDOKI FULL",	103, Mapper103_Init},
-	{ "Pegasus 5-in-1",	    104, Mapper104_Init},
+//	{"",					104, Mapper104_Init},
 	{"NES-EVENT NWC1990",	105, Mapper105_Init},
 	{"SMB3 PIRATE A",		106, Mapper106_Init},
 	{"MAGIC CORP A",		107, Mapper107_Init},
@@ -664,11 +801,11 @@ BMAPPINGLocal bmap[] = {
 	{"MMC3 PIRATE PROT. A",	121, Mapper121_Init},
 	{"JY043",				122, Mapper122_Init},
 	{"MMC3 PIRATE H2288",	123, UNLH2288_Init},
-	{"Super Game Mega Type 3",	124, Mapper124_Init},
+//	{"",					124, Mapper124_Init},
 	{"FDS LH32",			125, LH32_Init},
-	{ "PowerJoy 84-in-1 PJ-008", 126, Mapper126_Init },
-	{ "Double Dragon pirate", 127, Mapper127_Init },
-	{"1994 Super HiK 4-in-1", 128, Mapper128_Init},
+	{ "PowerJoy 84-in-1 PJ-008",					126, Mapper126_Init },
+//	{"",					127, Mapper127_Init},
+	{"1994 Super HiK 4-in-1",					128, Mapper128_Init},
 //	{"",					129, Mapper129_Init},
 //	{"",					130, Mapper130_Init},
 //	{"",					131, Mapper131_Init},
@@ -764,10 +901,10 @@ BMAPPINGLocal bmap[] = {
 	{"UNLN625092",			221, UNLN625092_Init},
 	{"",					222, Mapper222_Init},
 //	{"",					223, Mapper223_Init},
-	{"¾§¿ÆÌ© KT-008",		224, AA6023_Init   },
+	{"æ™¶ç§‘æ³° KT-008",		224, AA6023_Init   },
 	{"",					225, Mapper225_Init},
 	{"BMC 22+20-in-1",		226, Mapper226_Init},
-	{"ÍâÐÇ FW01",			227, Mapper227_Init},
+	{"å¤–æ˜Ÿ FW01",			227, Mapper227_Init},
 	{"Action 52",			228, Mapper228_Init},
 	{"SC 0892",				229, Mapper229_Init},
 	{"BMC Contra+22-in-1",	230, Mapper230_Init},
@@ -817,8 +954,8 @@ BMAPPINGLocal bmap[] = {
 	{ "80013-B", 274, BMC80013B_Init },
 	{ "09-078",	277, Mapper277_Init },
 	{ "K-3017",	280, Mapper280_Init },
-	{ "¾§Ì« YY860417C",	281, Mapper281_Init },
-	{ "¾§Ì« 860224C",	282, Mapper282_Init },
+	{ "æ™¶å¤ª YY860417C",	281, Mapper281_Init },
+	{ "æ™¶å¤ª 860224C",	282, Mapper282_Init },
 	{ "GS-2004/GS-2013", 283, BMCGS2004_Init },
 	{ "A65AS", 285, BMCA65AS_Init },
 	{ "BS-5", 286, BMCBS5_Init },
@@ -830,7 +967,7 @@ BMAPPINGLocal bmap[] = {
 	{ "DRAGONFIGHTER", 292, UNLBMW8544_Init },
 	{ "NewStar 12-in-1/7-in-1", 293, Mapper293_Init },
 	{ "63-1601 ",	294, Mapper294_Init },
-	{ "¾§Ì« YY860216C",	295, Mapper295_Init },
+	{ "æ™¶å¤ª YY860216C",	295, Mapper295_Init },
 	{ "TXC 01-22110-000",    297, Mapper297_Init },
 	{ "TF1201", 298, UNLTF1201_Init },
 	{ "11160", 299, BMC11160_Init },
@@ -860,7 +997,7 @@ BMAPPINGLocal bmap[] = {
 	{ "10-24-C-A1", 327, BMC1024CA1_Init },
 	{ "RT-01", 328, UNLRT01_Init },
 	{ "EDU2000", 329, UNLEDU2000_Init },
-	{ "Sangokushi II: Ha¨­ no Tairiku", 330, Mapper330_Init },
+	{ "Sangokushi II: HaÅ no Tairiku", 330, Mapper330_Init },
 	{ "12-IN-1", 331, BMC12IN1_Init },
 	{ "BMC-WS/WS-1001",	332, BMCWS_Init },
 	{ "NEWSTAR-GRM070-8IN1", 333, BMC8IN1_Init },
@@ -888,13 +1025,13 @@ BMAPPINGLocal bmap[] = {
 	{ "3D-BLOCK", 355, UNL3DBlock_Init },
 	{ "7-in-1 Rockman (JY-208)", 356, Mapper356_Init },
 	{ "Bit Corp 4-in-1", 357, Mapper357_Init },
-	{ "¾§Ì« YY860606C",	358, Mapper358_Init },
+	{ "æ™¶å¤ª YY860606C",	358, Mapper358_Init },
 	{ "SB-5013/GCL8050/841242C", 359, Mapper359_Init },
 	{ "Bitcorp 31-in-1",         360, Mapper360_Init },
 	{ "OK-411",	361, Mapper361_Init },
 	{ "830506C",	362, Mapper362_Init },
 	{ "5069", 363, Mapper363_Init },
-	{ "¾§Ì« JY830832C",	364, Mapper364_Init },
+	{ "æ™¶å¤ª JY830832C",	364, Mapper364_Init },
 	{ "GN-45", 366, Mapper366_Init },
 	{ "JC-016-2 variant", 367, Mapper367_Init },
 	{ "Yung-08", 368, Mapper368_Init },
@@ -904,19 +1041,19 @@ BMAPPINGLocal bmap[] = {
 	{ "MMC3 PIRATE SFC-13", 373, Mapper373_Init },
 	{ "Reset-based SLROM multicart",	374, Mapper374_Init },
 	{ "135-in-1", 375, Mapper375_Init },
-	{ "¾§Ì« YY841155C", 376, Mapper376_Init },
+	{ "æ™¶å¤ª YY841155C", 376, Mapper376_Init },
 	{ "JY-111/JY-112", 377, Mapper377_Init },
 	{ "8-in-1 AOROM+UNROM", 378, Mapper378_Init },
 	{ "35-in-1", 379, Mapper379_Init },
 	{ "42 to 80,000 (970630C)",	380, Mapper380_Init },
 	{ "KN-42",  381, Mapper381_Init },
 	{ "830928C",	382, Mapper382_Init },
-	{ "¾§Ì« YY840708C",	383, Mapper383_Init },
+	{ "æ™¶å¤ª YY840708C",	383, Mapper383_Init },
 	{ "L1A16",	384, Mapper384_Init },
 	{ "NTDEC 2779",	385, Mapper385_Init },
-	{ "¾§Ì« YY860729C",	386, Mapper386_Init },
-	{ "¾§Ì« YY850735C",	387, Mapper387_Init },
-	{ "¾§Ì« YY850835C",	388, Mapper388_Init },
+	{ "æ™¶å¤ª YY860729C",	386, Mapper386_Init },
+	{ "æ™¶å¤ª YY850735C",	387, Mapper387_Init },
+	{ "æ™¶å¤ª YY850835C",	388, Mapper388_Init },
 	{ "Caltron 9-in-1",	389, Mapper389_Init },
 	{ "Realtec 8031", 390, Mapper390_Init },
 	{ "NC7000M", 391, NC7000M_Init },
@@ -924,20 +1061,20 @@ BMAPPINGLocal bmap[] = {
 	{ "820720C", 393, Mapper393_Init },
 	{ "HSK007", 394, Mapper394_Init },
 	{ "Realtec 8210",	395, Mapper395_Init },
-	{ "¾§Ì« YY850437C",	396, Mapper396_Init },
-	{ "¾§Ì« YY850439C",	397, Mapper397_Init },
-	{ "¾§Ì« YY840820C",	398, Mapper398_Init },
+	{ "æ™¶å¤ª YY850437C",	396, Mapper396_Init },
+	{ "æ™¶å¤ª YY850439C",	397, Mapper397_Init },
+	{ "æ™¶å¤ª YY840820C",	398, Mapper398_Init },
 	{ "BATMAP-000",	399, Mapper399_Init },
 	{ "8BIT-XMAS", 400, Mapper400_Init },
 	{ "BMC Super 19-in-1 (VIP19)", 401, Mapper401_Init },
 	{ "831019C J-2282", 402, J2282_Init },
 	{ "89433", 403, Mapper403_Init },
-	{ "¾§Ì« JY012005",      404, Mapper404_Init },
+	{ "æ™¶å¤ª JY012005",      404, Mapper404_Init },
 	{ "Impact Soft",	406, Mapper406_Init },
 	{ "retroUSB DPCMcart", 409, Mapper409_Init },
 	{ "JY-302",  410, Mapper410_Init },
 	{ "A88S-1",	411, Mapper411_Init },
-	{ "ºã¸ñ FK-206 JG",	412, Mapper412_Init },
+	{ "æ’æ ¼ FK-206 JG",	412, Mapper412_Init },
 	{ "BATMAP-SRR-X",	413, Mapper413_Init },
 	{ "9999999-in-1",	414, Mapper414_Init },
 	{ "0353",	415, Mapper415_Init },
@@ -945,7 +1082,7 @@ BMAPPINGLocal bmap[] = {
 	{ "", 417, Mapper417_Init },
 	{ "820106-C/821007C", 418, Mapper418_Init },
 	{ "A971210",	420, Mapper420_Init },
-	{ "¾§Ì« SC871115C",	421, Mapper421_Init },
+	{ "æ™¶å¤ª SC871115C",	421, Mapper421_Init },
 	{ "BS-400R/BS-4040",	422, Mapper422_Init },
 	{ "BB-002A/TF2740",	428, Mapper428_Init },
 	{ "LIKO BBG-235-8-1B",	429, Mapper429_Init },
@@ -967,7 +1104,7 @@ BMAPPINGLocal bmap[] = {
 	{ "KL-06",	447, Mapper447_Init },
 	{ "830768C", 448, Mapper448_Init },
 	{ "22-in-1 King Series",	449, Mapper449_Init },
-	{ "¾§Ì« YY841157C",         450, Mapper450_Init },
+	{ "æ™¶å¤ª YY841157C",         450, Mapper450_Init },
 	{ "Haratyler HP/MP",		451, Mapper451_Init },
 	{ "DS-9-27",	452, Mapper452_Init },
 	{ "Realtec 8042",	453, Mapper453_Init },
@@ -1070,8 +1207,8 @@ BMAPPINGLocal bmap[] = {
 	{ "KONAMI QTAi Board",	547, QTAi_Init },
 	{ "CTC-15", 548, Mapper548_Init },
 	{ "Kaiser KS-7016B", 549, Mapper549_Init },
-	{ "¾§Ì« JY820845C",	550, Mapper550_Init },
-	{ "¾§¿ÆÌ© KT-xxx",	551, Mapper178_Init },
+	{ "æ™¶å¤ª JY820845C",	550, Mapper550_Init },
+	{ "æ™¶ç§‘æ³° KT-xxx",	551, Mapper178_Init },
 	{ "TAITO X1-017", 552, Mapper552_Init },
 	{ "SACHEN 3013",    553, Mapper553_Init },
 	{ "KS-7010", 554, Mapper554_Init },
@@ -1116,10 +1253,9 @@ BMAPPINGLocal bmap[] = {
 	{ "4MROM-512", 595, Mapper595_Init },
 	{ "FC-49", 596, Mapper596_Init },
 	{ "GN-27", 597, Mapper597_Init },
-	{ "K-3021, 3936", 598, Mapper598_Init },
+	{ "3936", 598, Mapper598_Init },
 	{ "ET-133A", 599, Mapper599_Init },
 	{ "J-2061", 603, Mapper603_Init },
-	{ "Dancing Expert", 604, Mapper604_Init },
 	{ "New Star TX5/8IN1", 605, Mapper605_Init },
 	{ "New Star T4IN1", 606, Mapper606_Init },
 	{ "4705", 607, Mapper607_Init },
@@ -1137,13 +1273,25 @@ BMAPPINGLocal bmap[] = {
 	{ "68-in-1", 619, Mapper619_Init },
 	{ "4782/820226", 620, Mapper620_Init },
 	{ "Unmarked Predator bootleg", 621, Mapper621_Init },
-	{ "3945", 622, Mapper622_Init},
+	{ "3945", 622, Mapper622_Init },
 	{ "J-2083", 623, Mapper623_Init },
 	{ "KL-08/KL-09B", 624, Mapper624_Init },
 	{ "ET-20", 625, Mapper625_Init },
 	{ "90-in-1", 626, Mapper626_Init },
-	{ "", 627, Mapper627_Init },
-	{ "Rainbow Mapper", 682, Mapper682_Init },
+	{ "821134", 627, Mapper627_Init },
+	{ "GC004", 628, Mapper628_Init },
+	{ "Rinco 12-in-1", 629, Mapper629_Init },
+	{ "200-in-1", 630, Mapper630_Init },
+	{ "YS4IN1", 631, Mapper631_Init },
+	{ "FC-71", 632, Mapper632_Init },
+	{ "P012IN1", 633, Mapper633_Init },
+	{ "125", 634, Mapper634_Init },
+	{ "19-in-1", 635, Mapper635_Init },
+	{ "Top_Star", 636, Mapper636_Init },
+	{ "KL003", 637, Mapper637_Init },
+	{ "ET-4337", 638, Mapper638_Init },
+	{ "3933", 639, Mapper639_Init },
+	{ "N6-H/D+RAM", 640, Mapper640_Init },
 	{ "ET-156",  731,  Mapper731_Init },
 	{ "W-03",  732,  Mapper732_Init },
 	{ "K-3054",  733,  Mapper733_Init },
@@ -1154,7 +1302,6 @@ BMAPPINGLocal bmap[] = {
 	{ "K-3091/GN-16",  738, Mapper738_Init },
 	{ "HC004 LV103",  739,  Mapper739_Init },
 	{ "N-80",  740,  Mapper740_Init },
-	{ "TQY FPGA Supervisor",  742,  Mapper742_Init },
 	{ "HN-02",  743,  Mapper743_Init },
 	{ "JY-014",  745,  Mapper745_Init },
 	{ "ET-82",  746,  Mapper746_Init },
@@ -1170,8 +1317,7 @@ BMAPPINGLocal bmap[] = {
 	{ "BS-N032", 763, Mapper763_Init },
 	{ "43-236/841134C", 764, Mapper764_Init },
 	{ "820315-C", 765, Mapper765_Init },
-	{ "FlameCyclone Mapper", 800, Mapper800_Init },
-	{ "Rainbow Mapper v1.3", 3872, Mapper3872_Init },
+	{ "FlameCyclone_Mapper", 800, Mapper800_Init },
 	{"",					0, NULL}
 };
 int iNESLoad(const char* name, FCEUFILE* fp, int OverwriteVidMode) {
@@ -1262,13 +1408,19 @@ int iNESLoad(const char* name, FCEUFILE* fp, int OverwriteVidMode) {
 	Temp_Rom_Size = ROM_size;
 	VROM_size = vrom_size_bytes >> 13;
 
-	ROM = (uint8*)FCEU_malloc(rom_size_bytes);
-	memset(ROM, 0xFF, rom_size_bytes);
+	// These buffers are fully initialized by the loader below. Avoid the
+	// legacy FCEU_malloc() zero-fill pass, which becomes very expensive for
+	// 64-512 MiB multicart images and is immediately overwritten by fread().
+	ROM = AllocateLargeROMBuffer((size_t)rom_size_bytes, ROMUsesVirtualAlloc);
 
 	if (vrom_size_bytes) {
-		VROM = (uint8*)FCEU_malloc(vrom_size_bytes);
-		memset(VROM, 0xFF, vrom_size_bytes);
+		VROM = AllocateLargeROMBuffer((size_t)vrom_size_bytes, VROMUsesVirtualAlloc);
 	}
+
+	// Compute the logical PRG/CHR hash ranges before loading so the ultra-large
+	// streaming path can calculate all hashes while the file is being read.
+	iNESCart.PRGRomSize = ROM_size >= 0xF00 ? (pow(2, head.ROM_size >> 2) * ((head.ROM_size & 3) * 2 + 1)) : (ROM_size * 0x4000);
+	iNESCart.CHRRomSize = VROM_size >= 0xF00 ? (pow(2, head.VROM_size >> 2) * ((head.VROM_size & 3) * 2 + 1)) : (VROM_size * 0x2000);
 
 	// Set Vs. System flag if need
 	if (!iNES2) {
@@ -1333,38 +1485,336 @@ int iNESLoad(const char* name, FCEUFILE* fp, int OverwriteVidMode) {
 
 	SetupCartPRGMapping(0, ROM, rom_size_bytes, 0);
 
-	FCEU_fread(ROM, 1, (round) ? rom_size_bytes : not_round_size, fp);
+	{
+	// Stage 3.6.6i v2: 64-512 MiB streaming load/hash pipeline.
+	//
+	// v1 removed duplicate post-load CRC scans and parallelized MD5 vs CRC.
+	// For very large images, however, even one complete post-load MD5 pass and
+	// one complete post-load CRC pass mean hundreds of MiB of extra memory
+	// traffic after fread() has already touched the same pages.  Here the main
+	// thread reads the final ROM buffers in 8 MiB chunks while two worker threads
+	// hash already-produced chunks.  No additional full-ROM pass is needed.
+	struct LargeRomHashJob {
+		uint8* data;
+		uint32 length;
+		uint32 logicalLength;
+		int region; // 0 = PRG, 1 = CHR
+		uint32 mappedCRC;
+		uint32 logicalCRC;
+	};
+
+	const uint64 totalHashBytes = (uint64)rom_size_bytes + (uint64)vrom_size_bytes;
+	const uint64 ultraPipelineThreshold = 64ULL * 1024ULL * 1024ULL;
+	// Larger blocks reduce synchronization overhead on 128-512 MiB images while
+	// still leaving enough jobs to overlap disk I/O with the hash workers.
+	const uint32 hashChunkBytes = totalHashBytes >= (128ULL * 1024ULL * 1024ULL)
+		? 16U * 1024U * 1024U
+		: 8U * 1024U * 1024U;
+	const unsigned int hashHardwareThreads = std::thread::hardware_concurrency();
+	const bool wantUltraPipeline = totalHashBytes >= ultraPipelineThreshold && hashHardwareThreads >= 3;
+
+	std::vector<LargeRomHashJob> hashJobs;
+	if (wantUltraPipeline)
+		hashJobs.reserve((size_t)(totalHashBytes / hashChunkBytes) + 8);
+	std::mutex hashMutex;
+	std::condition_variable hashCv;
+	bool hashJobsDone = false;
+	size_t md5JobIndex = 0;
+	size_t crcJobIndex = 0;
+	bool ultraPipelineActive = false;
+	std::thread md5HashThread;
+	std::vector<std::thread> crcHashThreads;
+
+	const bool prgLogicalMatchesMapped = iNESCart.PRGRomSize == (uint32)rom_size_bytes;
+	const bool chrLogicalMatchesMapped = iNESCart.CHRRomSize == (uint32)vrom_size_bytes;
+
+	bool cngMd5Active = false;
+	bool cngMd5Failed = false;
+#ifdef _WIN32
+	FCEUWinCngMD5 cngMd5;
+	if (wantUltraPipeline)
+		cngMd5Active = cngMd5.init();
+#endif
+	if (!cngMd5Active)
+		md5_starts(&md5);
+
+	auto md5Worker = [&]() {
+		for (;;) {
+			LargeRomHashJob job;
+			{
+				std::unique_lock<std::mutex> lock(hashMutex);
+				hashCv.wait(lock, [&]() { return hashJobsDone || md5JobIndex < hashJobs.size(); });
+				if (md5JobIndex >= hashJobs.size()) {
+					if (hashJobsDone)
+						break;
+					continue;
+				}
+				job = hashJobs[md5JobIndex++];
+			}
+#ifdef _WIN32
+			if (cngMd5Active) {
+				if (!cngMd5.update(job.data, job.length))
+					cngMd5Failed = true;
+			}
+			else
+#endif
+			{
+				md5_update(&md5, job.data, job.length);
+			}
+		}
+	};
+
+	// Unlike MD5, CRC-32 chunks can be calculated independently and combined
+	// later with CalcCRC32Combine().  Use several CRC workers on modern CPUs so
+	// 128/256/512 MiB images no longer serialize all CRC work on one core.
+	auto crcWorker = [&]() {
+		for (;;) {
+			size_t jobIndex = 0;
+			LargeRomHashJob job;
+			{
+				std::unique_lock<std::mutex> lock(hashMutex);
+				hashCv.wait(lock, [&]() { return hashJobsDone || crcJobIndex < hashJobs.size(); });
+				if (crcJobIndex >= hashJobs.size()) {
+					if (hashJobsDone)
+						break;
+					continue;
+				}
+				jobIndex = crcJobIndex++;
+				job = hashJobs[jobIndex];
+			}
+
+			const uint32 mappedCRC = CalcCRC32(0, job.data, job.length);
+			uint32 logicalCRC = 0;
+			if (job.logicalLength && job.logicalLength != job.length)
+				logicalCRC = CalcCRC32(0, job.data, job.logicalLength);
+			else if (job.logicalLength == job.length)
+				logicalCRC = mappedCRC;
+
+			{
+				std::lock_guard<std::mutex> lock(hashMutex);
+				hashJobs[jobIndex].mappedCRC = mappedCRC;
+				hashJobs[jobIndex].logicalCRC = logicalCRC;
+			}
+		}
+	};
+
+	if (wantUltraPipeline) {
+		try {
+			md5HashThread = std::thread(md5Worker);
+			unsigned int crcWorkerCount = 1;
+			if (hashHardwareThreads >= 12) crcWorkerCount = 3;
+			else if (hashHardwareThreads >= 8) crcWorkerCount = 2;
+			for (unsigned int i = 0; i < crcWorkerCount; ++i)
+				crcHashThreads.emplace_back(crcWorker);
+			ultraPipelineActive = true;
+		}
+		catch (...) {
+			// A partially-created worker must be released before falling back to
+			// the v1 post-load parallel hash path.
+			{
+				std::lock_guard<std::mutex> lock(hashMutex);
+				hashJobsDone = true;
+			}
+			hashCv.notify_all();
+			if (md5HashThread.joinable()) md5HashThread.join();
+			for (size_t i = 0; i < crcHashThreads.size(); ++i)
+				if (crcHashThreads[i].joinable()) crcHashThreads[i].join();
+			crcHashThreads.clear();
+			hashJobs.clear();
+			hashJobsDone = false;
+			md5JobIndex = crcJobIndex = 0;
+			cngMd5Active = false;
+			md5_starts(&md5);
+		}
+	}
+
+	auto enqueueHashJob = [&](uint8* data, uint32 length, uint32 logicalLength, int region) {
+		if (!ultraPipelineActive || !length)
+			return;
+		{
+			std::lock_guard<std::mutex> lock(hashMutex);
+			hashJobs.push_back(LargeRomHashJob{ data, length, logicalLength, region, 0, 0 });
+		}
+		hashCv.notify_all();
+	};
+
+	auto readAndQueueRegion = [&](uint8* dest, uint64 mappedSize, uint64 readTarget, uint64 logicalSize, int region) -> uint64 {
+		uint64 offset = 0;
+		while (offset < readTarget) {
+			const uint32 request = (uint32)(((readTarget - offset) > hashChunkBytes) ? hashChunkBytes : (readTarget - offset));
+			const uint64 got = FCEU_fread(dest + (size_t)offset, 1, request, fp);
+			if (got) {
+				uint32 logicalLength = 0;
+				if (offset < logicalSize) {
+					const uint64 logicalRemain = logicalSize - offset;
+					logicalLength = (uint32)((got < logicalRemain) ? got : logicalRemain);
+				}
+				enqueueHashJob(dest + (size_t)offset, (uint32)got, logicalLength, region);
+				offset += got;
+			}
+			if (got < request)
+				break;
+		}
+
+		// Only the unread/padding tail is initialized.  FCEU_malloc_uninitialized()
+		// deliberately avoided touching the pages that fread() will overwrite.
+		if (offset < mappedSize) {
+			uint64 padOffset = offset;
+			memset(dest + (size_t)padOffset, 0xFF, (size_t)(mappedSize - padOffset));
+			while (padOffset < mappedSize) {
+				const uint32 chunk = (uint32)(((mappedSize - padOffset) > hashChunkBytes) ? hashChunkBytes : (mappedSize - padOffset));
+				uint32 logicalLength = 0;
+				if (padOffset < logicalSize) {
+					const uint64 logicalRemain = logicalSize - padOffset;
+					logicalLength = (uint32)((chunk < logicalRemain) ? chunk : logicalRemain);
+				}
+				enqueueHashJob(dest + (size_t)padOffset, chunk, logicalLength, region);
+				padOffset += chunk;
+			}
+		}
+		return offset;
+	};
+
+	const uint64 prgReadTarget = (uint64)((round) ? rom_size_bytes : not_round_size);
+	readAndQueueRegion(ROM, (uint64)rom_size_bytes, prgReadTarget, (uint64)iNESCart.PRGRomSize, 0);
 
 	if (vrom_size_bytes)
-		FCEU_fread(VROM, 1, vrom_size_bytes, fp);
+		readAndQueueRegion(VROM, (uint64)vrom_size_bytes, (uint64)vrom_size_bytes, (uint64)iNESCart.CHRRomSize, 1);
 
 	// Misc ROMS
 	if ((head.misc_roms & 0x03) && !(head.ROM_type & 4)) {
 		MiscROM_size = filesize - rom_size_bytes - vrom_size_bytes;
-		MiscROM = (uint8*)FCEU_malloc(MiscROM_size);
-		memset(MiscROM, 0xFF, MiscROM_size);
-		FCEU_fread(MiscROM, 1, MiscROM_size, fp);
+		MiscROM = AllocateLargeROMBuffer((size_t)MiscROM_size, MiscROMUsesVirtualAlloc);
+		const uint64 miscBytesRead = FCEU_fread(MiscROM, 1, MiscROM_size, fp);
+		if (miscBytesRead < (uint64)MiscROM_size)
+			memset(MiscROM + (size_t)miscBytesRead, 0xFF, (size_t)((uint64)MiscROM_size - miscBytesRead));
 		FCEU_printf(" Misc ROM size : %d\n", MiscROM_size);
 	}
 
-	md5_starts(&md5);
-	md5_update(&md5, ROM, rom_size_bytes);
+	uint32 prgCRC32 = 0;
+	uint32 chrCRC32 = 0;
+	uint32 combinedCRC32 = 0;
 
-	iNESGameCRC32 = CalcCRC32(0, ROM, rom_size_bytes);
+	if (ultraPipelineActive) {
+		{
+			std::lock_guard<std::mutex> lock(hashMutex);
+			hashJobsDone = true;
+		}
+		hashCv.notify_all();
+		md5HashThread.join();
+		for (size_t i = 0; i < crcHashThreads.size(); ++i)
+			crcHashThreads[i].join();
 
-	if (vrom_size_bytes) {
-		iNESGameCRC32 = CalcCRC32(iNESGameCRC32, VROM, vrom_size_bytes);
-		md5_update(&md5, VROM, vrom_size_bytes);
+		bool md5Ready = false;
+#ifdef _WIN32
+		if (cngMd5Active && !cngMd5Failed)
+			md5Ready = cngMd5.finish(iNESCart.MD5);
+#endif
+		if (!md5Ready) {
+			// Rare fallback only if CNG was unavailable/failed.  Preserve the exact
+			// legacy digest rather than risking a partially calculated result.
+			md5_starts(&md5);
+			md5_update(&md5, ROM, rom_size_bytes);
+			if (vrom_size_bytes)
+				md5_update(&md5, VROM, vrom_size_bytes);
+			md5_finish(&md5, iNESCart.MD5);
+		}
+
+		uint32 mappedPrgCRC32 = 0;
+		uint32 mappedChrCRC32 = 0;
+		uint32 logicalPrgCRC32 = 0;
+		uint32 logicalChrCRC32 = 0;
+		for (size_t i = 0; i < hashJobs.size(); ++i) {
+			const LargeRomHashJob& job = hashJobs[i];
+			if (job.region == 0) {
+				mappedPrgCRC32 = CalcCRC32Combine(mappedPrgCRC32, job.mappedCRC, job.length);
+				if (!prgLogicalMatchesMapped && job.logicalLength)
+					logicalPrgCRC32 = CalcCRC32Combine(logicalPrgCRC32, job.logicalCRC, job.logicalLength);
+			}
+			else {
+				mappedChrCRC32 = CalcCRC32Combine(mappedChrCRC32, job.mappedCRC, job.length);
+				if (!chrLogicalMatchesMapped && job.logicalLength)
+					logicalChrCRC32 = CalcCRC32Combine(logicalChrCRC32, job.logicalCRC, job.logicalLength);
+			}
+		}
+
+		prgCRC32 = prgLogicalMatchesMapped ? mappedPrgCRC32 : logicalPrgCRC32;
+		chrCRC32 = chrLogicalMatchesMapped ? mappedChrCRC32 : logicalChrCRC32;
+		combinedCRC32 = vrom_size_bytes
+			? CalcCRC32Combine(mappedPrgCRC32, mappedChrCRC32, (uint64)vrom_size_bytes)
+			: mappedPrgCRC32;
 	}
-	md5_finish(&md5, iNESCart.MD5);
+	else {
+		// v1 path for small/medium images and machines with fewer than three
+		// hardware threads: MD5 and CRC run in parallel after loading.
+		auto calculateCRCs = [&]() {
+			prgCRC32 = CalcCRC32(0, ROM, iNESCart.PRGRomSize);
+			chrCRC32 = (VROM && iNESCart.CHRRomSize) ? CalcCRC32(0, VROM, iNESCart.CHRRomSize) : 0;
+
+			if (iNESCart.PRGRomSize == (uint32)rom_size_bytes &&
+				iNESCart.CHRRomSize == (uint32)vrom_size_bytes) {
+				combinedCRC32 = vrom_size_bytes
+					? CalcCRC32Combine(prgCRC32, chrCRC32, (uint64)vrom_size_bytes)
+					: prgCRC32;
+			}
+			else {
+				combinedCRC32 = CalcCRC32(0, ROM, rom_size_bytes);
+				if (vrom_size_bytes)
+					combinedCRC32 = CalcCRC32(combinedCRC32, VROM, vrom_size_bytes);
+			}
+		};
+
+		auto calculateMD5 = [&]() {
+#ifdef _WIN32
+			if (totalHashBytes >= ultraPipelineThreshold) {
+				FCEUWinCngMD5 fastMd5;
+				if (fastMd5.init() &&
+					fastMd5.update(ROM, (uint32)rom_size_bytes) &&
+					(!vrom_size_bytes || fastMd5.update(VROM, (uint32)vrom_size_bytes)) &&
+					fastMd5.finish(iNESCart.MD5))
+					return;
+			}
+#endif
+			md5_starts(&md5);
+			md5_update(&md5, ROM, rom_size_bytes);
+			if (vrom_size_bytes)
+				md5_update(&md5, VROM, vrom_size_bytes);
+			md5_finish(&md5, iNESCart.MD5);
+		};
+
+		const uint64 parallelHashThreshold = 4ULL * 1024ULL * 1024ULL;
+		if (totalHashBytes > parallelHashThreshold && hashHardwareThreads > 1) {
+			bool crcThreadStarted = false;
+			std::thread crcThread;
+			try {
+				crcThread = std::thread(calculateCRCs);
+				crcThreadStarted = true;
+			}
+			catch (...) {
+			}
+
+			calculateMD5();
+			if (crcThreadStarted)
+				crcThread.join();
+			else
+				calculateCRCs();
+		}
+		else {
+			calculateMD5();
+			calculateCRCs();
+		}
+	}
+
+	iNESGameCRC32 = combinedCRC32;
+	iNESCart.PRGCRC32 = prgCRC32;
+	iNESCart.CHRCRC32 = chrCRC32;
+
 	memcpy(&GameInfo->MD5, &iNESCart.MD5, sizeof(iNESCart.MD5));
 	for (int x = 0; x < 8; x++)
 		partialmd5 |= (uint64)iNESCart.MD5[7 - x] << (x * 8);
-	iNESCart.PRGRomSize = ROM_size >= 0xF00 ? (pow(2, head.ROM_size >> 2) * ((head.ROM_size & 3) * 2 + 1)) : (ROM_size * 0x4000);
-	iNESCart.CHRRomSize = VROM_size >= 0xF00 ? (pow(2, head.VROM_size >> 2) * ((head.VROM_size & 3) * 2 + 1)) : (VROM_size * 0x2000);
-	iNESCart.PRGCRC32 = CalcCRC32(0, ROM, iNESCart.PRGRomSize);
-	iNESCart.CHRCRC32 = CalcCRC32(0, VROM, iNESCart.CHRRomSize);
+
 	iNESCart.CRC32 = iNESGameCRC32;
+	}
 
 	FCEU_printf(" PRG ROM: %d x 16KiB = %d KiB\n", (round ? rom_size_bytes : not_round_size) >> 14, ((round ? rom_size_bytes : not_round_size) >> 14) * 16);
 	FCEU_printf(" CHR ROM: %d x  8KiB = %d KiB\n", (vrom_size_bytes >> 13), (vrom_size_bytes >> 13) * 8);
@@ -1463,14 +1913,11 @@ int iNESLoad(const char* name, FCEUFILE* fp, int OverwriteVidMode) {
 	}
 
 init_error:
-	if (ROM) free(ROM);
-	if (VROM) free(VROM);
-	if (MiscROM) free(MiscROM);
+	FreeLargeROMBuffer(ROM, ROMUsesVirtualAlloc);
+	FreeLargeROMBuffer(VROM, VROMUsesVirtualAlloc);
+	FreeLargeROMBuffer(MiscROM, MiscROMUsesVirtualAlloc);
 	if (trainerpoo) free(trainerpoo);
 	if (ExtraNTARAM) free(ExtraNTARAM);
-	ROM = NULL;
-	VROM = NULL;
-	MiscROM = NULL;
 	MiscROM_size = 0;
 	trainerpoo = NULL;
 	ExtraNTARAM = NULL;

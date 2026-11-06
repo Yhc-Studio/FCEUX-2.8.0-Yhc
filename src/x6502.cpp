@@ -23,6 +23,7 @@
 #include "fceu.h"
 #include "debug.h"
 #include "sound.h"
+#include "cart.h"
 #ifdef _S9XLUA_H
 #include "fceulua.h"
 #endif
@@ -30,6 +31,7 @@
 #include "x6502abbrev.h"
 
 #include <cstring>
+#include <stdint.h>
 X6502 X;
 uint32 timestamp;
 uint32 soundtimestamp;
@@ -124,7 +126,19 @@ void X6502_MemHook::Remove(enum X6502_MemHook::Type type,
 //normal memory read
 static INLINE uint8 RdMem(unsigned int A)
 {
- _DB=ARead[A](A);
+ // Stage 3.6.6c v1.1: direct CartBR read fast path.
+ // Preserve the handler table as authority. Only bypass the indirect call
+ // when this exact address is currently mapped to side-effect-free CartBR.
+ readfunc stage366cReader = ARead[A];
+ if (stage366cReader == CartBR)
+ {
+  uint8* stage366cBase = Page[A >> 11];
+  _DB = stage366cBase ? *(uint8*)((uintptr_t)stage366cBase + (uintptr_t)A) : X.DB;
+ }
+ else
+ {
+  _DB = stage366cReader(A);
+ }
   if (readMemHook)
   {
       readMemHook->call(A, _DB);

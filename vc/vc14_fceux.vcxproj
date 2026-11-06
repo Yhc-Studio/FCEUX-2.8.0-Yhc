@@ -219,6 +219,7 @@ xcopy /y /d "$(ProjectDir)\..\src\drivers\win\7z_64.dll" "$(OutDir)"</Command>
       <DataExecutionPrevention>
       </DataExecutionPrevention>
       <TargetMachine>MachineX86</TargetMachine>
+      <LargeAddressAware>true</LargeAddressAware>
     </Link>
     <Manifest>
       <AdditionalManifestFiles>$(ProjectDir)../src/drivers/win/fceu_x86.manifest;%(AdditionalManifestFiles)</AdditionalManifestFiles>
@@ -436,7 +437,9 @@ xcopy /y /d "$(ProjectDir)\..\src\drivers\win\7z_64.dll" "$(OutDir)"</Command>
     <ClCompile Include="..\src\boards\190.cpp" />
     <ClCompile Include="..\src\boards\191.cpp" />
     <ClCompile Include="..\src\boards\193.cpp" />
+    <ClCompile Include="..\src\boards\196.cpp" />
     <ClCompile Include="..\src\boards\199.cpp" />
+    <ClCompile Include="..\src\boards\205.cpp" />
     <ClCompile Include="..\src\boards\206_486.cpp" />
     <ClCompile Include="..\src\boards\208.cpp" />
     <ClCompile Include="..\src\boards\213.cpp" />
@@ -493,6 +496,7 @@ xcopy /y /d "$(ProjectDir)\..\src\drivers\win\7z_64.dll" "$(OutDir)"</Command>
     <ClCompile Include="..\src\boards\363.cpp" />
     <ClCompile Include="..\src\boards\364.cpp" />
     <ClCompile Include="..\src\boards\366.cpp" />
+    <ClCompile Include="..\src\boards\367.cpp" />
     <ClCompile Include="..\src\boards\368.cpp" />
     <ClCompile Include="..\src\boards\369.cpp" />
     <ClCompile Include="..\src\boards\370.cpp" />
@@ -688,7 +692,21 @@ xcopy /y /d "$(ProjectDir)\..\src\drivers\win\7z_64.dll" "$(OutDir)"</Command>
     <ClCompile Include="..\src\boards\623.cpp" />
     <ClCompile Include="..\src\boards\624.cpp" />
     <ClCompile Include="..\src\boards\625.cpp" />
+    <ClCompile Include="..\src\boards\626.cpp" />
     <ClCompile Include="..\src\boards\627.cpp" />
+    <ClCompile Include="..\src\boards\628.cpp" />
+    <ClCompile Include="..\src\boards\629.cpp" />
+    <ClCompile Include="..\src\boards\630.cpp" />
+    <ClCompile Include="..\src\boards\631.cpp" />
+    <ClCompile Include="..\src\boards\632.cpp" />
+    <ClCompile Include="..\src\boards\633.cpp" />
+    <ClCompile Include="..\src\boards\634.cpp" />
+    <ClCompile Include="..\src\boards\635.cpp" />
+    <ClCompile Include="..\src\boards\636.cpp" />
+    <ClCompile Include="..\src\boards\637.cpp" />
+    <ClCompile Include="..\src\boards\638.cpp" />
+    <ClCompile Include="..\src\boards\639.cpp" />
+    <ClCompile Include="..\src\boards\640.cpp" />
     <ClCompile Include="..\src\boards\65.cpp" />
     <ClCompile Include="..\src\boards\67.cpp" />
     <ClCompile Include="..\src\boards\68.cpp" />
@@ -764,6 +782,7 @@ xcopy /y /d "$(ProjectDir)\..\src\drivers\win\7z_64.dll" "$(OutDir)"</Command>
     <ClCompile Include="..\src\boards\coolboy.cpp" />
     <ClCompile Include="..\src\boards\coolgirl.cpp" />
     <ClCompile Include="..\src\boards\dance2000.cpp" />
+    <ClCompile Include="..\src\boards\eeprom_24C0x.cpp" />
     <ClCompile Include="..\src\boards\eeprom_93Cx6.cpp" />
     <ClCompile Include="..\src\boards\eh8813a.cpp" />
     <ClCompile Include="..\src\boards\et-100.cpp" />
@@ -1338,6 +1357,7 @@ xcopy /y /d "$(ProjectDir)\..\src\drivers\win\7z_64.dll" "$(OutDir)"</Command>
     <ClInclude Include="..\src\boards\asic_vrc6.h" />
     <ClInclude Include="..\src\boards\asic_vrc7.h" />
     <ClInclude Include="..\src\boards\cartram.h" />
+    <ClInclude Include="..\src\boards\eeprom_24C0x.h" />
     <ClInclude Include="..\src\boards\eeprom_93Cx6.h" />
     <ClInclude Include="..\src\boards\fifo.h" />
     <ClInclude Include="..\src\boards\flashrom.h" />

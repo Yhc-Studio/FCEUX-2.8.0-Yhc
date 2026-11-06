@@ -21,9 +21,9 @@
  /* Multicarts based around the ING003C and TEC9719 enhanced MMC3 ASICs.
 	ING003C's scanline counter is inverted from MMC3, while TEC9719 is normal.
 	Both ASICs natively only support 256 KiB of CHR ROM/RAM; cartridges with more than that re-purpose higher PRG address as CHR address lines. There are two connection variants of this re-purposing.
-	Mapper 422: TEC9719, CHR A18=PRG A20, CHR A19=PRG A21
-	Mapper 126: TEC9719, CHR A18=PRG A21, CHR A19=PRG A20
-	Mapper 534: ING003C, CHR A18=PRG A20, CHR A19=PRG A21
+	Mapper 422: TEC9719, CHR A18= PRG A20, CHR A19= PRG A21
+	Mapper 126: TEC9719, CHR A18= PRG A21, CHR A19= PRG A20
+	Mapper 534: ING003C, CHR A18= PRG A20, CHR A19= PRG A21
 
 	Cartridges with more than one PRG ROM chip are sometimes not connected to form one continuous address space. Submappers are used to avoid having to repeat data to accomodate them.
 	Submapper 0: Normal connection
@@ -31,6 +31,9 @@
 	Submapper 2: Register bit 6001.2 (undocumented in data sheet) selects between two 1 MiB chips
 	Submapper 3: 6000.2 substitutes PRG A14 and CHR A14 with 6000.5
 	Submapper 4: LD822 PCB - CHR A20..A18 = PRG A20..A18
+	Submapper 5: Additional serial shift register listening to 6000.1-2
+	Submapper 6: Additional parallel register activated via 6000.2
+	Submapper 7: Additional parallel register activated via 6000.2, two address lines different
 
 	Both ASICs invert the register bit that selects PRG A21 (6000.5), hence "EXPREGS[0] ^0x20".
  */
@@ -39,25 +42,46 @@
 #include "mmc3.h"
 #include "../ines.h"
 
-static uint8 reverseCHR_A18_A19;
-static uint8 invertC000;
-static uint8 SL0;
-static uint8 submapper;
+static uint8_t reverseCHR_A18_A19;
+static uint8_t invertC000;
+static uint8_t SL0;
+static uint8_t submapper;
 
-static uint8 getMMC3Bank(int bank) {
+static uint8_t getMMC3Bank(int bank) {
 	if (~bank & 1 && MMC3_cmd & 0x40) bank ^= 2;
 	return bank & 2 ? 0xFE | bank & 1 : DRegBuf[6 | bank & 1];
 }
 
-static void wrapPRG(uint32 A, uint8 V) {
+static void wrapPRG(uint32_t A, uint8_t V) {
 	int prgAND = EXPREGS[0] & 0x40 ? 0x0F : 0x1F; /* 128 KiB or 256 KiB inner PRG bank selection */
 	int prgOR = (EXPREGS[0] << 4 & 0x70 | (EXPREGS[0] ^ 0x20) << 3 & 0x180) & ~prgAND; /* Outer PRG bank */
-	if (submapper == 1) prgOR = prgOR & 0x7F | prgOR >> 1 & 0x80;    /* Submapper 1 uses PRG A21 as a chip select between two 1 MiB chips */
-	if (submapper == 2) prgOR = prgOR & 0x7F | EXPREGS[1] << 5 & 0x80;   /* Submapper 2 uses 6001.2 (not documented in datasheet) as a chip select between two 1 MiB chips */
-	if (submapper == 3 && EXPREGS[0] & 0x04) { /* Submapper 3 replace PRG A14 with PRG A21 */
+
+	/* Submapper 1 uses PRG A21 as a chip select between two 1 MiB chips */
+	if (submapper == 1) prgOR = prgOR & 0x7F | prgOR >> 1 & 0x80;
+
+	/* Submapper 2 uses 6001.2 (not documented in datasheet) as a chip select between two 1 MiB chips */
+	if (submapper == 2) prgOR = prgOR & 0x7F | EXPREGS[1] << 5 & 0x80;
+
+	/* Submapper 3 replace PRG A14 with PRG A21 */
+	if (submapper == 3 && EXPREGS[0] & 0x04) {
 		prgAND &= ~0x02;
 		prgOR |= EXPREGS[0] & 0x20 ? 0x00 : 0x02;
 	}
+
+	/* Submapper 5 has an additional serial shift register for higher address lines, addressing up to 32 MiB. */
+	if (submapper == 5) prgOR |= EXPREGS[4] << 9;
+
+	/* Submappers 6 and 7 use an additional 6-bit register for A22..A17 and 6000.0 for A23. They only differ in the order of two address lines. */
+	if (submapper == 6) {
+		prgOR = EXPREGS[0] << 4 & 0x10 | EXPREGS[4] << 5 & 0x20 | EXPREGS[4] << 3 & 0x40 | EXPREGS[4] << 3 & 0x80 | EXPREGS[4] << 3 & 0x700 | EXPREGS[0] << 7 & 0x800;
+		prgOR &= ~prgAND;
+	}
+	else
+		if (submapper == 7) {
+			prgOR = EXPREGS[0] << 4 & 0x10 | EXPREGS[4] << 5 & 0x20 | EXPREGS[4] << 2 & 0x40 | EXPREGS[4] << 4 & 0x80 | EXPREGS[4] << 3 & 0x700 | EXPREGS[0] << 7 & 0x800;
+			prgOR &= ~prgAND;
+		}
+
 	for (A = 0; A < 4; A++) {
 		/* In UNROM-like mode (CT3=1, CT2=1, CT0=1), MMC3 sees A13=0 and A14=CPU A14 during reads, making register 6 apply from $8000-$BFFF, and the fixed bank from $C000-$FFFF.
 		   In NROM-128, NROM-256, ANROM and UNROM modes (CT0=1), MMC3 sees A13=0 and A14=0, making register 6 apply from $8000-$FFFF. */
@@ -80,7 +104,7 @@ static void wrapPRG(uint32 A, uint8 V) {
 	mwrap(A000B); /* After 8000 write */
 }
 
-static void wrapCHR(uint32 A, uint8 V) {
+static void wrapCHR(uint32_t A, uint8_t V) {
 	int chrAND = EXPREGS[0] & 0x80 ? 0x7F : 0xFF; /* 128 KiB or 256 KiB innter CHR bank selection */
 	int chrOR; /* outer CHR bank */
 	if (reverseCHR_A18_A19) /* Mapper 126 swaps CHR A18 and A19 */
@@ -101,7 +125,7 @@ static void wrapCHR(uint32 A, uint8 V) {
 		setchr1(A, (V & chrAND) | chrOR);
 }
 
-static void wrapMirroring(uint8 V) {
+static void wrapMirroring(uint8_t V) {
 	A000B = V;
 	if (EXPREGS[3] & 0x20) { /* ANROM mirroring */
 		if (DRegBuf[6] & 0x10)
@@ -125,6 +149,13 @@ static void wrapMirroring(uint8 V) {
 
 static DECLFW(writeWRAM) {
 	CartBW(A, V);
+
+	/* Submapper 5: fill additional shift register at a falling edge of 6000.2 */
+	if (submapper == 5 && !(A & 3) && V & 0x20 && EXPREGS[0] & 0x04 && ~V & 0x04) EXPREGS[4] = EXPREGS[4] << 1 | EXPREGS[0] >> 1 & 0x01;
+
+	/* Submapper 6/7: fill additional register at a rising edge of 6000.2 */
+	if ((submapper == 6 || submapper == 7) && !(A & 3) && ~EXPREGS[0] & 0x04 && V & 0x04) EXPREGS[4] = V & ~0x06;
+
 	if ((A & 3) == 2) { /* CNROM Bank (D0-D3), Bank Enable (D4-D6) and Bank Enable Lock (D7) */
 		int latchMask = 0xFF & ~(EXPREGS[2] & 0x80 ? 0xF0 : 0x00) & ~(EXPREGS[2] >> 3 & 0x0E);
 		EXPREGS[2] = EXPREGS[2] & ~latchMask | V & latchMask;
@@ -167,13 +198,13 @@ static DECLFR(readPRG) {
 
 static void reset(void) {
 	SL0++; /* Soft-resetting cycles through SL0 settings */
-	EXPREGS[0] = EXPREGS[1] = EXPREGS[2] = EXPREGS[3] = 0;
+	EXPREGS[0] = EXPREGS[1] = EXPREGS[2] = EXPREGS[3] = EXPREGS[4] = 0;
 	MMC3RegReset();
 }
 
 static void power(void) {
 	SL0 = 0;
-	EXPREGS[0] = EXPREGS[1] = EXPREGS[2] = EXPREGS[3] = 0;
+	EXPREGS[0] = EXPREGS[1] = EXPREGS[2] = EXPREGS[3] = EXPREGS[4] = 0;
 	GenMMC3Power();
 	SetWriteHandler(0x6000, 0x7FFF, writeWRAM);
 	SetWriteHandler(0x8000, 0xFFFF, writeCart);
@@ -190,7 +221,7 @@ static void init(CartInfo* info) {
 	info->Power = power;
 	info->Reset = reset;
 
-	AddExState(EXPREGS, 4, 0, "EXPR");
+	AddExState(EXPREGS, submapper < 5 ? 4 : 5, 0, "EXPR");
 	AddExState(&SL0, 1, 0, "DPSW");
 }
 

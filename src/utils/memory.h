@@ -18,17 +18,19 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
+#ifndef _FCEU_MEMORY_H_
+#define _FCEU_MEMORY_H_
+
 /*        Various macros for faster memory stuff
 		(at least that's the idea) 
 */
-#ifndef _MEMORY_H
-#define _MEMORY_H
-
 
 #define FCEU_dwmemset(d,c,n) {int _x; for(_x=n-4;_x>=0;_x-=4) *(uint32 *)&(d)[_x]=c;}
 
 //returns a buffer initialized to 0
 void *FCEU_malloc(size_t size);
+// Allocate without clearing. Use only when the caller fully initializes the buffer.
+void *FCEU_malloc_uninitialized(size_t size);
 
 //returns a buffer, with jumbled initial contents
 //used by boards for WRAM etc, initialized to 0 (default) or other via RAMInitOption
@@ -58,4 +60,5 @@ void FCEU_dfree(void *ptr);
 
 //aborts the process for fatal errors
 void FCEU_abort(const char* message = nullptr);
-#endif // !1
+
+#endif // _FCEU_MEMORY_H_
