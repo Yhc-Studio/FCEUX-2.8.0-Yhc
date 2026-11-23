@@ -30,8 +30,8 @@ static uint16 VRC3_reload;
 static SFORMAT VRC3_state[] = {
 	{&VRC3_prg, 1, "VC3P" },
 	{&VRC3_irq, 1, "VC3I" },
-	{&VRC3_count, 1, "VC3C" },
-	{&VRC3_reload, 1, "VC3R" },
+	{&VRC3_count, 2 | FCEUSTATE_RLSB, "VC3C" },
+	{&VRC3_reload, 2 | FCEUSTATE_RLSB, "VC3R" },
 	{ 0 }
 };
 
@@ -72,7 +72,8 @@ DECLFW (VRC3_write) {
 }
 
 void VRC3_cpuCycle (int a) {
-	while (a--) {
+	while (a-- > 0) {
+		if (!(VRC3_irq & 0x02)) continue; // Disabled IRQ must not advance/trigger.
 		int mask = VRC3_irq &4? 0xFF: 0xFFFF;
 		if ((VRC3_count++ &mask) == mask) {
 			VRC3_count = VRC3_reload;

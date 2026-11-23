@@ -779,10 +779,12 @@ static void DisassembleInternal(HWND hWnd, int id, int scrollid, unsigned int ad
 		if (symbDebugEnabled)
 			disassembly_operands.resize(i + 1);
 
-		size = opsize[GetMem(addr)];
+		uint8 decodedOpcode = X6502_DecodeOpcodeForDebug(GetMem(addr));
+		size = opsize[decodedOpcode];
 		if (size == 0)
 		{
-			swprintf(chr, L"%02X        UNDEFINED", GetMem(addr++));
+			swprintf(chr, L"%02X        UNDEFINED", decodedOpcode);
+			addr++;
 			wcscat(debug_wstr, chr);
 		}
 		else
@@ -797,7 +799,9 @@ static void DisassembleInternal(HWND hWnd, int id, int scrollid, unsigned int ad
 				int shown = 0;
 				for (; shown < available; ++shown)
 				{
-					swprintf(chr, L"%02X ", GetMem(addr++));
+					uint8 shownByte = GetMem(addr++);
+					if (shown == 0) shownByte = decodedOpcode;
+					swprintf(chr, L"%02X ", shownByte);
 					wcscat(debug_wstr, chr);
 				}
 				while (shown++ < 3)
@@ -808,7 +812,9 @@ static void DisassembleInternal(HWND hWnd, int id, int scrollid, unsigned int ad
 			{
 				for (int j = 0; j < size; j++)
 				{
-					swprintf(chr, L"%02X ", opcode[j] = GetMem(addr++));
+					opcode[j] = GetMem(addr++);
+					if (j == 0) opcode[j] = decodedOpcode;
+					swprintf(chr, L"%02X ", opcode[j]);
 					wcscat(debug_wstr, chr);
 				}
 				while (size < 3)
@@ -1227,20 +1233,24 @@ char* DisassembleLine(int addr) {
 	uint8 opcode[3];
 
 	sprintf(str, "%02X:%04X: ", getBank(addr), addr);
-	size = opsize[GetMem(addr)];
+	uint8 decodedOpcode = X6502_DecodeOpcodeForDebug(GetMem(addr));
+	size = opsize[decodedOpcode];
 	if (size == 0)
 	{
-		sprintf(chr, "%02X        UNDEFINED", GetMem(addr++));
+		sprintf(chr, "%02X        UNDEFINED", decodedOpcode);
+		addr++;
 		strcat(str, chr);
 	}
 	else {
 		if ((addr + size) > 0x10000) {
-			sprintf(chr, "%02X        OVERFLOW", GetMem(addr));
+			sprintf(chr, "%02X        OVERFLOW", decodedOpcode);
 			strcat(str, chr);
 		}
 		else {
 			for (j = 0; j < size; j++) {
-				sprintf(chr, "%02X ", opcode[j] = GetMem(addr++));
+				opcode[j] = GetMem(addr++);
+				if (j == 0) opcode[j] = decodedOpcode;
+				sprintf(chr, "%02X ", opcode[j]);
 				strcat(str, chr);
 			}
 			while (size < 3) {
@@ -1501,7 +1511,7 @@ void UpdateDebugger(bool jump_to_pc)
 	SetDlgItemText(hDebug, IDC_DEBUGGER_VAL_SPR, str);
 
 	extern int linestartts;
-#define GETLASTPIXEL    (PAL?((timestamp*48-linestartts)/15) : ((timestamp*48-linestartts)/16) )
+#define GETLASTPIXEL    (PAL?((X6502_GetPPUTimestamp48()-(uint32)linestartts)/15) : ((X6502_GetPPUTimestamp48()-(uint32)linestartts)/16) )
 
 	int ppupixel = GETLASTPIXEL;
 

@@ -4289,7 +4289,7 @@ void  ConsoleDebugger::updateRegisterView(void)
 	oamAddrDsp->setText( tr(stmp) );
 
 	extern int linestartts;
-	#define GETLASTPIXEL    (PAL?((timestamp*48-linestartts)/15) : ((timestamp*48-linestartts)/16) )
+	#define GETLASTPIXEL    (PAL?((X6502_GetPPUTimestamp48()-(uint32)linestartts)/15) : ((X6502_GetPPUTimestamp48()-(uint32)linestartts)/16) )
 	
 	int ppupixel = GETLASTPIXEL;
 

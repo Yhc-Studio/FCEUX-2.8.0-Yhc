@@ -468,24 +468,49 @@ void FARIDSLROM8IN1_Init(CartInfo *info) {
 * 1996 Super HiK 4-in-1 - 新系列超級飛狼組合卡 (JY-051)
 */
 static uint8 game = 0;
+static uint8 gameMask = 3;
+
 static void M374PRG(uint32 A, uint8 V) {
-	setprg16(A, (V & 0x07) | (game << 3));
+	setprg16(A, (V & 0x07) | ((uint32)game << 3));
 }
 
 static void M374CHR(uint32 A, uint8 V) {
-	setchr4(A, (V & 0x1F) | (game << 5));
+	setchr4(A, (V & 0x1F) | ((uint32)game << 5));
 }
 
 static void M374Reset(void) {
-	game = (game + 1) & 3;
+	game = (game + 1) & gameMask;
 	MMC1CMReset();
 }
 
-void Mapper374_Init(CartInfo *info) {
+void Mapper374_Init(CartInfo* info) {
+	game = 0;
+
+	/*
+		Each sub-game:
+		  PRG = 128 KiB
+		  CHR = 128 KiB
+
+		Supported configurations:
+		  4  games =  512 KiB PRG +  512 KiB CHR
+		  8  games = 1024 KiB PRG + 1024 KiB CHR
+		  16 games = 2048 KiB PRG + 2048 KiB CHR
+	*/
+
+	if (PRGsize[0] >= 2048 * 1024 && CHRsize[0] >= 2048 * 1024)
+		gameMask = 0x0F;	// 16 games
+	else if (PRGsize[0] >= 1024 * 1024 && CHRsize[0] >= 1024 * 1024)
+		gameMask = 0x07;	// 8 games
+	else
+		gameMask = 0x03;	// original 4 games
+
 	GenMMC1Init(info, 128, 128, 0, 0);
+
 	MMC1CHRHook4 = M374CHR;
 	MMC1PRGHook16 = M374PRG;
+
 	info->Reset = M374Reset;
+
 	AddExState(&game, 1, 0, "GAME");
 }
 

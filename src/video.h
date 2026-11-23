@@ -2,6 +2,7 @@
 #define _VIDEO_H_
 int FCEU_InitVirtualVideo(void);
 void FCEU_KillVirtualVideo(void);
+void FCEU_ResetVideoFrameState(int clearFrameBuffers);
 int SaveSnapshot(void);
 int SaveSnapshot(char[]);
 void ResetScreenshotsCounter();
@@ -20,6 +21,10 @@ extern uint8 *XBackBuf;
 extern uint8 *XDBuf;
 extern uint8 *XDBackBuf;
 extern xfbuf_t *XFBuf;
+/* VT369 Stage 2.4.6: latched for the complete rendered frame whenever any
+ * pixel was produced in the direct RGB555 domain.  HUD/blit code must use
+ * this instead of the live $201E state, which may be cleared in VBlank. */
+extern uint8 FCEU_VT369FrameDirectColor;
 
 extern int ClipSidesOffset;
 

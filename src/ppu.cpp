@@ -385,6 +385,23 @@ uint8 XOffset = 0;
 uint8 SpriteDMA = 0; // $4014 / Writing $xx copies 256 bytes by reading from $xx00-$xxFF and writing to $2004 (OAM data)
 
 uint32 TempAddr = 0, RefreshAddr = 0, DummyRead = 0, NTRefreshAddr = 0;
+/* VT369 12/09/0F special mode has a VRAM-DMA destination latch that follows
+ * the two-write $2006 address, independently of normal PPUDATA incrementing. */
+static uint16 VT369DMAVRAMTarget = 0;
+uint16 FCEUX_PPUGetVT369DMAVRAMTarget(void) { return VT369DMAVRAMTarget & 0x3FFF; }
+void FCEUX_PPUSetVT369DMAVRAMTarget(uint16 target) { VT369DMAVRAMTarget = target & 0x3FFF; }
+
+int FCEUX_PPUApplyVTCGRAMDMABug(void) {
+	/* VT32 software commonly compensates for the original VT palette-DMA
+	 * off-by-one by starting at $3F01. The current extended renderer is the
+	 * classic PPU path, so shift that live $2007 address back one byte here.
+	 * Leave newppu untouched until it has a native VT renderer/address API. */
+	if (!newppu && ((RefreshAddr & 0x3FFF) == 0x3F01)) {
+		RefreshAddr = (RefreshAddr - 1) & 0x7FFF;
+		return 1;
+	}
+	return 0;
+}
 
 static int maxsprites = 8;
 
@@ -593,10 +610,32 @@ uint8 FASTCALL FFCEUX_PPURead_Default(uint32 A) {
 
 uint8(FASTCALL* FFCEUX_PPURead)(uint32 A) = 0;
 void (*FFCEUX_PPUWrite)(uint32 A, uint8 V) = 0;
+uint8(FASTCALL* FFCEUX_PPUReadCPU)(uint32 A) = 0;
+void (*FFCEUX_PPUWriteCPU)(uint32 A, uint8 V) = 0;
+uint8(FASTCALL* FFCEUX_PPUReadPatternExt)(uint32 A, uint8 attr, uint8 isSprite, uint8 plane) = 0;
+uint8(FASTCALL* FFCEUX_PPUGetPackedMode)(void) = 0;
+uint8(FASTCALL* FFCEUX_PPUReadPackedBG)(uint32 refreshAddr, uint8 pixel) = 0;
+uint8(FASTCALL* FFCEUX_PPUReadPackedSprite)(uint8 tile, uint8 row, uint8 byteIndex) = 0;
+uint8(FASTCALL* FFCEUX_PPUGetExtMode)(void) = 0;
+uint8(FASTCALL* FFCEUX_PPUMapExtPalette)(uint8 pen) = 0;
+uint8(FASTCALL* FFCEUX_PPUUseFixedOSD)(void) = 0;
+void(FASTCALL* FFCEUX_PPURefreshExtPalette)(void) = 0;
+uint8(FASTCALL* FFCEUX_PPUGetVT369Mode)(void) = 0;
+uint8(FASTCALL* FFCEUX_PPUReadVT369Reg)(uint8 reg) = 0;
+uint8(FASTCALL* FFCEUX_PPUReadVT369BG)(uint32 address, uint8 color, uint8 pixel) = 0;
+uint8(FASTCALL* FFCEUX_PPUReadVT369BG16)(uint16 tile, uint8 row, uint8 pixel) = 0;
+uint8(FASTCALL* FFCEUX_PPUReadVT369Sprite)(uint16 tile, uint8 row, uint8 pixel, uint8 bpp, uint8 alt16, uint8 rightTable) = 0;
+uint8(FASTCALL* FFCEUX_PPUReadVT369HiResSprite)(uint16 tile, uint8 width, uint8 height, uint8 row, uint8 pixel, uint8 bpp) = 0;
+uint16(FASTCALL* FFCEUX_PPUGetVT369SpriteConfig)(void) = 0;
+uint8(FASTCALL* FFCEUX_PPUReadVT369OAM)(uint16 index) = 0;
+uint8(FASTCALL* FFCEUX_PPUGetVT369OAMHigh)(void) = 0;
+void(FASTCALL* FFCEUX_PPUWriteVT369OAM)(uint8 low, uint8 value) = 0;
 
 #define CALL_PPUREAD(A) (FFCEUX_PPURead(A))
+#define CALL_PPUREAD_CPU(A) (FFCEUX_PPUReadCPU ? FFCEUX_PPUReadCPU(A) : CALL_PPUREAD(A))
 
 #define CALL_PPUWRITE(A, V) (FFCEUX_PPUWrite ? FFCEUX_PPUWrite(A, V) : FFCEUX_PPUWrite_Default(A, V))
+#define CALL_PPUWRITE_CPU(A, V) (FFCEUX_PPUWriteCPU ? FFCEUX_PPUWriteCPU(A, V) : CALL_PPUWRITE(A, V))
 
 //whether to use the new ppu
 int newppu = 0;
@@ -641,6 +680,13 @@ static DECLFR(A2002) {
 }
 
 static DECLFR(A2004) {
+	/* VT369 enhanced mode extends OAM to 512 bytes.  Keep the core 2C02 OAM
+	 * untouched and let the active OneBus board provide the ninth address bit. */
+	if (FFCEUX_PPUGetVT369Mode && FFCEUX_PPUReadVT369OAM && FFCEUX_PPUGetVT369OAMHigh &&
+		(FFCEUX_PPUGetVT369Mode() & 0x01)) {
+		const uint16 index = (uint16)PPU[3] | ((uint16)(FFCEUX_PPUGetVT369OAMHigh() & 1) << 8);
+		return FFCEUX_PPUReadVT369OAM(index);
+	}
 	if (newppu) {
 		if ((ppur.status.sl < 241) && PPUON) {
 			// from cycles 0 to 63, the
@@ -807,12 +853,11 @@ static DECLFR(A2007) {
 		ret = VRAMBuffer;
 		RefreshAddr = ppur.get_2007access() & 0x3FFF;
 		if ((RefreshAddr & 0x3F00) == 0x3F00) {
-			//if it is in the palette range bypass the
-			//delayed read, and what gets filled in the temp
-			//buffer is the address - 0x1000, also
-			//if grayscale is set then the return is AND with 0x30
-			//to get a gray color reading
-			if (!(tmp & 3)) {
+			// Palette RAM is directly readable. Boards with an extended PPU
+			// (currently OneBus/VT03) may expose more than the NES 32 bytes.
+			if (FFCEUX_PPUReadCPU)
+				ret = CALL_PPUREAD_CPU(tmp);
+			else if (!(tmp & 3)) {
 				if (!(tmp & 0xC))
 					ret = READPAL(0x00);
 				else
@@ -820,12 +865,12 @@ static DECLFR(A2007) {
 			}
 			else
 				ret = READPAL(tmp & 0x1F);
-			VRAMBuffer = CALL_PPUREAD(RefreshAddr - 0x1000);
+			VRAMBuffer = CALL_PPUREAD_CPU(RefreshAddr - 0x1000);
 		}
 		else {
 			if (debug_loggingCD && (RefreshAddr < 0x2000))
 				LogAddress = GetCHRAddress(RefreshAddr);
-			VRAMBuffer = CALL_PPUREAD(RefreshAddr);
+			VRAMBuffer = CALL_PPUREAD_CPU(RefreshAddr);
 		}
 		ppur.increment2007(ppur.status.sl >= 0 && ppur.status.sl < 241 && PPUON, INC32 != 0);
 		RefreshAddr = ppur.get_2007access();
@@ -837,7 +882,9 @@ static DECLFR(A2007) {
 		FCEUPPU_LineUpdate();
 
 		if (tmp >= 0x3F00) {	// Palette RAM tied directly to the output data, without VRAM buffer
-			if (!(tmp & 3)) {
+			if (FFCEUX_PPUReadCPU)
+				ret = CALL_PPUREAD_CPU(tmp);
+			else if (!(tmp & 3)) {
 				if (!(tmp & 0xC))
 					ret = READPAL(0x00);
 				else
@@ -849,11 +896,15 @@ static DECLFR(A2007) {
 			if (!fceuindbg)
 #endif
 			{
-				if ((tmp - 0x1000) < 0x2000)
-					VRAMBuffer = VPage[(tmp - 0x1000) >> 10][tmp - 0x1000];
-				else
-					VRAMBuffer = vnapage[((tmp - 0x1000) >> 10) & 0x3][(tmp - 0x1000) & 0x3FF];
-				if (PPU_hook) PPU_hook(tmp);
+				if (FFCEUX_PPUReadCPU)
+					VRAMBuffer = CALL_PPUREAD_CPU(tmp - 0x1000);
+				else {
+					if ((tmp - 0x1000) < 0x2000)
+						VRAMBuffer = VPage[(tmp - 0x1000) >> 10][tmp - 0x1000];
+					else
+						VRAMBuffer = vnapage[((tmp - 0x1000) >> 10) & 0x3][(tmp - 0x1000) & 0x3FF];
+					if (PPU_hook) PPU_hook(tmp);
+				}
 			}
 		}
 		else {
@@ -862,20 +913,25 @@ static DECLFR(A2007) {
 			if (!fceuindbg)
 #endif
 			{
-				if (PPU_hook) PPU_hook(tmp);
 				PPUGenLatch = VRAMBuffer;
-				if (tmp < 0x2000) {
-
-					if (debug_loggingCD)
+				if (FFCEUX_PPUReadCPU) {
+					if (debug_loggingCD && tmp < 0x2000)
 						LogAddress = GetCHRAddress(tmp);
-					if (MMC5Hack && newppu)
-						VRAMBuffer = *MMC5BGVRAMADR(tmp);
-					else
-						VRAMBuffer = VPage[tmp >> 10][tmp];
-
+					VRAMBuffer = CALL_PPUREAD_CPU(tmp);
 				}
-				else if (tmp < 0x3F00)
-					VRAMBuffer = vnapage[(tmp >> 10) & 0x3][tmp & 0x3FF];
+				else {
+					if (PPU_hook) PPU_hook(tmp);
+					if (tmp < 0x2000) {
+						if (debug_loggingCD)
+							LogAddress = GetCHRAddress(tmp);
+						if (MMC5Hack && newppu)
+							VRAMBuffer = *MMC5BGVRAMADR(tmp);
+						else
+							VRAMBuffer = VPage[tmp >> 10][tmp];
+					}
+					else if (tmp < 0x3F00)
+						VRAMBuffer = vnapage[(tmp >> 10) & 0x3][tmp & 0x3FF];
+				}
 			}
 		}
 
@@ -927,11 +983,24 @@ static DECLFW(B2000) {
 }
 
 static DECLFW(B2001) {
+	const bool wasRendering = (PPU[1] & 0x18) != 0;
 	FCEUPPU_LineUpdate();
 	if (paldeemphswap)
 		V = (V & 0x9F) | ((V & 0x40) >> 1) | ((V & 0x20) << 1);
 	PPUGenLatch = V;
 	PPU[1] = V;
+
+	// VT369 special 64-byte-name-table mode reloads the PPU refresh address
+	// when rendering transitions from disabled to enabled. Commercial VT369
+	// software uses this around DMA/scroll updates; retaining the stale
+	// RefreshAddr produces horizontal bands and repeated rows.
+	if (!wasRendering && (V & 0x18) && FFCEUX_PPUReadVT369Reg &&
+		FFCEUX_PPUReadVT369Reg(0x0C) == 0x12 &&
+		FFCEUX_PPUReadVT369Reg(0x0D) == 0x09 &&
+		FFCEUX_PPUReadVT369Reg(0x0E) == 0x0F) {
+		RefreshAddr = TempAddr;
+		if (PPU_hook) PPU_hook(RefreshAddr & 0x3FFF);
+	}
 
 	// Keep the cached emphasis state synchronized even when bits 5-7
 	// are cleared.  The previous code left the last non-zero value in
@@ -951,6 +1020,17 @@ static DECLFW(B2003) {
 
 static DECLFW(B2004) {
 	PPUGenLatch = V;
+	/* Keep VT369's private 512-byte OAM coherent even before enhanced mode
+	 * is enabled; games may DMA normal-layout OAM first and switch $201E
+	 * afterwards.  $2008.0 selects the high 256-byte page explicitly. */
+	if (FFCEUX_PPUWriteVT369OAM) {
+		FFCEUX_PPUWriteVT369OAM(PPU[3], V);
+		if (FFCEUX_PPUGetVT369Mode && (FFCEUX_PPUGetVT369Mode() & 0x01)) {
+			PPU[3] = (PPU[3] + 1) & 0xFF;
+			PPUSPL = PPU[3] & 7;
+			return;
+		}
+	}
 	if (newppu) {
 		//the attribute upper bits are not connected
 		//so AND them out on write, since reading them
@@ -1000,6 +1080,15 @@ static DECLFW(B2006) {
 	FCEUPPU_LineUpdate();
 
 	PPUGenLatch = V;
+	/* In the VT369 special 64-byte-name mode, the new VRAM DMA engine
+	 * captures its destination from $2006 exactly as software programs it. */
+	if (FFCEUX_PPUReadVT369Reg && FFCEUX_PPUReadVT369Reg(0x0C) == 0x12 &&
+		FFCEUX_PPUReadVT369Reg(0x0D) == 0x09 && FFCEUX_PPUReadVT369Reg(0x0E) == 0x0F) {
+		if (!vtoggle)
+			VT369DMAVRAMTarget = (uint16)((VT369DMAVRAMTarget & 0x00FF) | ((V & 0x3F) << 8));
+		else
+			VT369DMAVRAMTarget = (uint16)((VT369DMAVRAMTarget & 0x3F00) | V);
+	}
 	if (!vtoggle) {
 		TempAddr &= 0x00FF;
 		TempAddr |= (V & 0x3f) << 8;
@@ -1040,13 +1129,16 @@ static DECLFW(B2007) {
 	if (newppu) {
 		PPUGenLatch = V;
 		RefreshAddr = ppur.get_2007access() & 0x3FFF;
-		CALL_PPUWRITE(RefreshAddr, V);
+		CALL_PPUWRITE_CPU(RefreshAddr, V);
 		ppur.increment2007(ppur.status.sl >= 0 && ppur.status.sl < 241 && PPUON, INC32 != 0);
 		RefreshAddr = ppur.get_2007access();
 	}
 	else {
 		PPUGenLatch = V;
-		if (tmp < 0x2000) {
+		if (FFCEUX_PPUWriteCPU) {
+			CALL_PPUWRITE_CPU(tmp, V);
+		}
+		else if (tmp < 0x2000) {
 			if (PPUCHRRAM & (1 << (tmp >> 10)))
 				VPage[tmp >> 10][tmp] = V;
 		}
@@ -1082,6 +1174,10 @@ static DECLFW(B4014) {
 	uint32 t = V << 8;
 	int x;
 
+	/* The 256 read/write pairs cost 512 cycles.  OAM DMA additionally halts
+	 * the CPU for one cycle and consumes a second alignment cycle on one CPU
+	 * phase, for the documented 513/514-cycle total. */
+	X6502_AddCycles(1 + (timestamp & 1));
 	for (x = 0; x < 256; x++)
 		X6502_DMW(0x2004, X6502_DMR(t + x));
 	SpriteDMA = V;
@@ -1089,20 +1185,140 @@ static DECLFW(B4014) {
 
 #define PAL(c)  ((c) + cc)
 
-#define GETLASTPIXEL    (PAL ? ((timestamp * 48 - linestartts) / 15) : ((timestamp * 48 - linestartts) >> 4))
+#define GETLASTPIXEL    (PAL ? ((X6502_GetPPUTimestamp48() - (uint32)linestartts) / 15) : ((X6502_GetPPUTimestamp48() - (uint32)linestartts) >> 4))
 
 static uint8* Pline, * Plinef;
 static int firsttile;
+
+/* VT03 renderer side-band state.  Standard FCEUX encodes BG transparency and
+ * sprite priority in bits 6/7 of the 8-bit framebuffer value.  VT03 needs all
+ * seven low bits for its extended palette index, so keep those flags separate
+ * whenever an extended OneBus video mode is live. */
+static uint8 VTBGVisible[256];
+static uint8 VTSpriteVisible[256];
+static uint8 VTSpriteBehind[256];
+static uint8 VTSpritePlane2[64];
+static uint8 VTSpritePlane3[64];
+static uint8 VT32PackedSpritePixels[64][32];
+static uint8 VT32PackedSpriteAttr[64];
+static uint8 VT32PackedSpriteX[64];
+/* VT369 has independent 256-colour BG and OBJ palettes.  XBuf stores the
+ * low 8-bit pen while this flag selects the OBJ half; DoLine later encodes
+ * the combined 0..511 index through XBuf+XDBuf. */
+static uint8 VT369OBJPixel[256];
+/* Stage 2.4.1: mark only pixels actually produced by the VT369 RGB555
+ * renderer.  XDBuf bit7 later carries this domain to the video backend, while
+ * bits0..2 remain the 9-bit palette index high bits.  This allows one scanline
+ * to contain both enhanced RGB555 pixels and ordinary NES/VT HUD pixels. */
+static uint8 VT369DirectPixel[256];
+/* Stage 2.4.3: freeze the actual RGB555 value at render time instead of
+ * carrying only a 9-bit palette index to the frame-end blitter.  VT369
+ * software can rewrite $5000-$53FF during raster effects; storing the raw
+ * 15-bit colour prevents later palette writes from recolouring pixels that
+ * were already drawn earlier in the frame. */
+static uint16 VT369RawColor[256];
+/* Stage 2.4.9: enhanced VT369 sprites use a private one-line frozen row.
+ * The row is captured after the OneBus HBlank IRQ CPU slice, so the following
+ * scanline sees the split handler's CHR/OAM state.  CopySprites() never performs
+ * a late live rebuild of the current row. */
+static uint8 VT369PrefetchPixel[256];
+static uint8 VT369PrefetchVisible[256];
+static uint8 VT369PrefetchBehind[256];
+static uint8 VT369PrefetchSprite0[256];
+static uint8 VT369PrefetchAny = 0;
+static int VT369PrefetchLine = -1;
+/* Stage 2.4.4: sprite pixels are prefetched one line ahead, but their RGB555
+ * palette value must be sampled while the CURRENT visible line is being
+ * produced.  Palette RAM can change during a raster split; waiting until
+ * CopySprites() at end-of-line would recolour the whole sprite row with the
+ * final palette state and create one-scanline streaks. */
+static uint16 VT369SpriteRawColor[256];
+static uint8 VT369SpriteRawValid[256];
+static int VT369SpriteColorLatchX = 0;
+static void VT369PrefetchSprites(int targetScanline);
+static void VT369ComposePrefetchedSprites(uint8* target);
+
+static INLINE uint8 VTMode(void) {
+	return FFCEUX_PPUGetExtMode ? FFCEUX_PPUGetExtMode() : 0;
+}
+static INLINE uint8 VT369Mode(void) {
+	return FFCEUX_PPUGetVT369Mode ? FFCEUX_PPUGetVT369Mode() : 0;
+}
+static INLINE int VT369RendererActive(void) {
+	const uint8 mode = VT369Mode();
+	/* Stage 2.2 also enables the Cube Tech high-resolution compatibility
+	 * fetcher.  It is downsampled into FCEUX's existing 256-pixel scanline,
+	 * matching the current reference model's 8x8 compatibility presentation. */
+	return FFCEUX_PPUReadVT369BG && (mode & 0x01);
+}
+static INLINE int VTRendererActive(void) {
+	return VT369RendererActive() || (FFCEUX_PPUReadPatternExt && FFCEUX_PPUGetExtMode && (VTMode() & 0x9F));
+}
+static INLINE uint8 VT32PackedMode(void) {
+	return FFCEUX_PPUGetPackedMode ? FFCEUX_PPUGetPackedMode() : 0;
+}
+
+static INLINE uint16 VT369SnapshotRGB555(uint16 index) {
+	/* FCEU_DirectPalette512 is updated immediately after the board flushes the
+	 * current partial scanline and before the new palette byte takes effect.
+	 * Its 8-bit channels were expanded from exact 5-bit values, so >>3 recovers
+	 * the original xRRRRRGGGGGBBBBB payload losslessly. */
+	const pal &c = FCEU_DirectPalette512[index & 0x1FF];
+	return (uint16)(((uint16)(c.r >> 3) << 10) |
+	                ((uint16)(c.g >> 3) << 5) |
+	                ((uint16)(c.b >> 3)));
+}
+
+static void VT369LatchSpriteColors(int lastpixel) {
+	if (!VT369RendererActive() || VT369PrefetchLine != scanline) return;
+	int endx = lastpixel - 16;
+	if (endx < 0) endx = 0;
+	if (endx > 256) endx = 256;
+	if (endx <= VT369SpriteColorLatchX) return;
+	for (int x = VT369SpriteColorLatchX; x < endx; ++x) {
+		if (!VT369PrefetchVisible[x]) continue;
+		VT369SpriteRawColor[x] = VT369SnapshotRGB555((uint16)VT369PrefetchPixel[x] + 256);
+		VT369SpriteRawValid[x] = 1;
+	}
+	VT369SpriteColorLatchX = endx;
+}
+
+/* VT16/VT09 SPOPEN makes the 16-colour/16-pixel choice per sprite.
+ * With SP16EN clear, sprites stay 2bpp.  With SP16EN set and SPOPEN clear,
+ * PIX16EN is the legacy global selector.  With SPOPEN set, OAM attribute
+ * bit 4 is the selector for that sprite. */
+static INLINE int VTSpriteUses16Pixels(uint8 mode, uint8 attr) {
+	if (!(mode & 0x04)) return 0; /* SP16EN */
+	if (mode & 0x20) return (attr & 0x10) ? 1 : 0; /* SPOPEN */
+	return (mode & 0x01) ? 1 : 0; /* PIX16EN */
+}
+
 int linestartts;	//no longer static so the debugger can see it
 static int tofix = 0;
 
 static void ResetRL(uint8* target) {
 	memset(target, 0xFF, 256);
+	/* Fast-forward R1: these side buffers exist only for OneBus extended video.
+	 * Ordinary NES/MMC games used to clear ~2 KiB of VT-only state on every
+	 * scanline even though no VT callback was installed.  Keep their historical
+	 * framebuffer path free of those memory writes. */
+	const int vtExtVideo = (FFCEUX_PPUGetExtMode != 0) || (FFCEUX_PPUGetPackedMode != 0) ||
+		(FFCEUX_PPUGetVT369Mode != 0);
+	if (vtExtVideo)
+		memset(VTBGVisible, 0, sizeof(VTBGVisible));
+	if (FFCEUX_PPUGetVT369Mode) {
+		memset(VT369OBJPixel, 0, sizeof(VT369OBJPixel));
+		memset(VT369DirectPixel, 0, sizeof(VT369DirectPixel));
+		memset(VT369RawColor, 0, sizeof(VT369RawColor));
+		memset(VT369SpriteRawColor, 0, sizeof(VT369SpriteRawColor));
+		memset(VT369SpriteRawValid, 0, sizeof(VT369SpriteRawValid));
+		VT369SpriteColorLatchX = 0;
+	}
 	InputScanlineHook(0, 0, 0, 0);
 	Plinef = target;
 	Pline = target;
 	firsttile = 0;
-	linestartts = timestamp * 48 + X.count;
+	linestartts = (int)(X6502_GetPPUTimestamp48() + X.count);
 	tofix = 0;
 	FCEUPPU_LineUpdate();
 	tofix = 1;
@@ -1120,6 +1336,7 @@ void FCEUPPU_LineUpdate(void) {
 		if (Pline) {
 			int l = GETLASTPIXEL;
 			RefreshLine(l);
+			if (FFCEUX_PPUGetVT369Mode) VT369LatchSpriteColors(l);
 		}
 }
 
@@ -1139,6 +1356,7 @@ static void CheckSpriteHit(int p);
 
 static void EndRL(void) {
 	RefreshLine(272);
+	if (FFCEUX_PPUGetVT369Mode) VT369LatchSpriteColors(272);
 	if (tofix)
 		Fixit1();
 	CheckSpriteHit(272);
@@ -1153,9 +1371,11 @@ static void CheckSpriteHit(int p) {
 	int x;
 
 	if (sphitx == 0x100) return;
+	const int vtRender = VTRendererActive();
 
 	for (x = sphitx; x < (sphitx + 8) && x < l; x++) {
-		if ((sphitdata & (0x80 >> (x - sphitx))) && !(Plinef[x] & 64) && x < 255) {
+		const int bgOpaque = vtRender ? VTBGVisible[x] : !(Plinef[x] & 64);
+		if ((sphitdata & (0x80 >> (x - sphitx))) && bgOpaque && x < 255) {
 			PPU_status |= 0x40;
 			sphitx = 0x100;
 			break;
@@ -1169,8 +1389,15 @@ static int spork = 0;
 
 // lasttile is really "second to last tile."
 static void RefreshLine(int lastpixel) {
-	static uint32 pshift[2];
+	static uint32 pshift[4];
 	static uint32 atlatch;
+	/* Two-tile packed-color FIFO used by the VT32 $2010=$80 renderer.  It
+	 * mirrors the ordinary pattern shifter's fine-X behavior without forcing
+	 * VT32 packed pixels through the VT03 four-plane bit layout. */
+	static uint8 vtpackedshift[16];
+	/* VT369 packed 4/8bpp also needs a two-tile FIFO so fine-X scrolling
+	 * behaves like the classic pattern shifters. */
+	static uint8 vt369shift[16];
 	uint32 smorkus = RefreshAddr;
 
 #define RefreshAddr smorkus
@@ -1178,6 +1405,40 @@ static void RefreshLine(int lastpixel) {
 	int X1;
 
 	uint8* P = Pline;
+	/* Fast-Forward R2: decide once per RefreshLine whether the expensive OneBus
+	 * video path exists.  Ordinary mappers then use pputile_novt.inc and never
+	 * execute VT mode/function-pointer tests in the per-tile inner loop. */
+	const int vtExtVideo = (FFCEUX_PPUGetExtMode != 0) || (FFCEUX_PPUGetPackedMode != 0) ||
+		(FFCEUX_PPUGetVT369Mode != 0);
+	const uint8 vtmode = vtExtVideo ? VTMode() : 0;
+	const uint8 vt369mode = vtExtVideo ? VT369Mode() : 0;
+	const int vtrender = vtExtVideo && ((FFCEUX_PPUReadVT369BG && (vt369mode & 0x01)) ||
+		(FFCEUX_PPUReadPatternExt && FFCEUX_PPUGetExtMode && (vtmode & 0x9F)));
+	const uint8 vtpacked = (vtExtVideo && FFCEUX_PPUGetPackedMode && FFCEUX_PPUReadPackedBG)
+		? FFCEUX_PPUGetPackedMode() : 0;
+
+	/* pshift[2:3] are VT-only.  The normal fast include deliberately does not
+	 * touch them; clear the extended pipeline once when a VT renderer is first
+	 * installed so a ROM switch cannot expose stale upper-plane bits. */
+	static int lastVTExtVideo = 0;
+	if (vtExtVideo && !lastVTExtVideo) {
+		pshift[2] = pshift[3] = 0;
+		memset(vt369shift, 0, sizeof(vt369shift));
+	}
+	lastVTExtVideo = vtExtVideo;
+
+	/* Stage 2.4.9: FCEUX's classic renderer normally carries the two-tile
+	 * pattern pipeline across the scanline boundary.  That is safe for ordinary
+	 * NES rendering because the real PPU also fetches the first tiles of the
+	 * next row during HBlank.  VT369 multicarts, however, commonly change packed
+	 * CHR/resource banks from their OneBus timer IRQ during that same HBlank.
+	 * Carrying vt369shift across the boundary therefore preserves pre-IRQ data
+	 * for one row.  Re-prime the private packed FIFO from the post-IRQ live state
+	 * at the first visible fetch of every line.  The first two X1 iterations are
+	 * fetch-only, so clearing here does not blank visible pixels. */
+	if (vtrender && (vt369mode & 0x01) && firsttile == 0)
+		memset(vt369shift, 0, sizeof(vt369shift));
+
 	int lasttile = lastpixel >> 3;
 	int numtiles;
 	static int norecurse = 0;	// Yeah, recursion would be bad.
@@ -1208,8 +1469,12 @@ static void RefreshLine(int lastpixel) {
 
 	if (!ScreenON && !SpriteON) {
 		uint32 tem;
-		tem = READPAL(0) | (READPAL(0) << 8) | (READPAL(0) << 16) | (READPAL(0) << 24);
-		tem |= 0x40404040;
+		if (vtrender)
+			tem = 0;
+		else {
+			tem = READPAL(0) | (READPAL(0) << 8) | (READPAL(0) << 16) | (READPAL(0) << 24);
+			tem |= 0x40404040;
+		}
 		FCEU_dwmemset(Pline, tem, numtiles * 8);
 		P += numtiles * 8;
 		Pline = P;
@@ -1237,84 +1502,172 @@ static void RefreshLine(int lastpixel) {
 	//This high-level graphics MMC5 emulation code was written for MMC5 carts in "CL" mode.
 	//It's probably not totally correct for carts in "SL" mode.
 
-#define PPUT_MMC5
-	if (MMC5Hack && geniestage != 1) {
-		if (MMC5HackCHRMode == 0 && (MMC5HackSPMode & 0x80)) {
-			int tochange = MMC5HackSPMode & 0x1F;
-			tochange -= firsttile;
-			for (X1 = firsttile; X1 < lasttile; X1++) {
-				if ((tochange <= 0 && MMC5HackSPMode & 0x40) || (tochange > 0 && !(MMC5HackSPMode & 0x40))) {
-#define PPUT_MMC5SP
-#include "pputile.inc"
-#undef PPUT_MMC5SP
+/* Fast-Forward R2: split the legacy and OneBus tile loops at scanline scope.
+	 * This costs one predictable branch per RefreshLine instead of several VT
+	 * branches and callback tests per 8-pixel tile. */
+	if (!vtExtVideo) {
+	#define PPUT_MMC5
+		if (MMC5Hack && geniestage != 1) {
+			if (MMC5HackCHRMode == 0 && (MMC5HackSPMode & 0x80)) {
+				int tochange = MMC5HackSPMode & 0x1F;
+				tochange -= firsttile;
+				for (X1 = firsttile; X1 < lasttile; X1++) {
+					if ((tochange <= 0 && MMC5HackSPMode & 0x40) || (tochange > 0 && !(MMC5HackSPMode & 0x40))) {
+	#define PPUT_MMC5SP
+	#include "pputile_novt.inc"
+	#undef PPUT_MMC5SP
+					}
+					else {
+	#include "pputile_novt.inc"
+					}
+					tochange--;
 				}
-				else {
-#include "pputile.inc"
-				}
-				tochange--;
 			}
-		}
-		else if (MMC5HackCHRMode == 1 && (MMC5HackSPMode & 0x80)) {
-			int tochange = MMC5HackSPMode & 0x1F;
-			tochange -= firsttile;
+			else if (MMC5HackCHRMode == 1 && (MMC5HackSPMode & 0x80)) {
+				int tochange = MMC5HackSPMode & 0x1F;
+				tochange -= firsttile;
 
-#define PPUT_MMC5SP
-#define PPUT_MMC5CHR1
-			for (X1 = firsttile; X1 < lasttile; X1++) {
-#include "pputile.inc"
+	#define PPUT_MMC5SP
+	#define PPUT_MMC5CHR1
+				for (X1 = firsttile; X1 < lasttile; X1++) {
+	#include "pputile_novt.inc"
+				}
+	#undef PPUT_MMC5CHR1
+	#undef PPUT_MMC5SP
 			}
-#undef PPUT_MMC5CHR1
-#undef PPUT_MMC5SP
+			else if (MMC5HackCHRMode == 1) {
+	#define PPUT_MMC5CHR1
+				for (X1 = firsttile; X1 < lasttile; X1++) {
+	#include "pputile_novt.inc"
+				}
+	#undef PPUT_MMC5CHR1
+			}
+			else {
+				for (X1 = firsttile; X1 < lasttile; X1++) {
+	#include "pputile_novt.inc"
+				}
+			}
 		}
-		else if (MMC5HackCHRMode == 1) {
-#define PPUT_MMC5CHR1
-			for (X1 = firsttile; X1 < lasttile; X1++) {
-#include "pputile.inc"
+	#undef PPUT_MMC5
+		else if (PPU_hook) {
+			norecurse = 1;
+	#define PPUT_HOOK
+			if (PEC586Hack) {
+	#define PPU_BGFETCH
+				for (X1 = firsttile; X1 < lasttile; X1++) {
+	#include "pputile_novt.inc"
+				}
+	#undef PPU_BGFETCH
 			}
-#undef PPUT_MMC5CHR1
+			else {
+				for (X1 = firsttile; X1 < lasttile; X1++) {
+	#include "pputile_novt.inc"
+				}
+			}
+	#undef PPUT_HOOK
+			norecurse = 0;
 		}
 		else {
-			for (X1 = firsttile; X1 < lasttile; X1++) {
-#include "pputile.inc"
+			if (PEC586Hack) {
+	#define PPU_BGFETCH
+				for (X1 = firsttile; X1 < lasttile; X1++) {
+	#include "pputile_novt.inc"
+				}
+	#undef PPU_BGFETCH
+			} if (QTAIHack) {
+	#define PPU_VRC5FETCH
+				for (X1 = firsttile; X1 < lasttile; X1++) {
+	#include "pputile_novt.inc"
+				}
+	#undef PPU_VRC5FETCH
+			}
+			else {
+				for (X1 = firsttile; X1 < lasttile; X1++) {
+	#include "pputile_novt.inc"
+				}
 			}
 		}
-	}
-#undef PPUT_MMC5
-	else if (PPU_hook) {
-		norecurse = 1;
-#define PPUT_HOOK
-		if (PEC586Hack) {
-#define PPU_BGFETCH
-			for (X1 = firsttile; X1 < lasttile; X1++) {
-#include "pputile.inc"
-			}
-#undef PPU_BGFETCH
-		}
-		else {
-			for (X1 = firsttile; X1 < lasttile; X1++) {
-#include "pputile.inc"
-			}
-		}
-#undef PPUT_HOOK
-		norecurse = 0;
 	}
 	else {
-		if (PEC586Hack) {
-#define PPU_BGFETCH
-			for (X1 = firsttile; X1 < lasttile; X1++) {
-#include "pputile.inc"
+	#define PPUT_MMC5
+		if (MMC5Hack && geniestage != 1) {
+			if (MMC5HackCHRMode == 0 && (MMC5HackSPMode & 0x80)) {
+				int tochange = MMC5HackSPMode & 0x1F;
+				tochange -= firsttile;
+				for (X1 = firsttile; X1 < lasttile; X1++) {
+					if ((tochange <= 0 && MMC5HackSPMode & 0x40) || (tochange > 0 && !(MMC5HackSPMode & 0x40))) {
+	#define PPUT_MMC5SP
+	#include "pputile.inc"
+	#undef PPUT_MMC5SP
+					}
+					else {
+	#include "pputile.inc"
+					}
+					tochange--;
+				}
 			}
-#undef PPU_BGFETCH
-		} if (QTAIHack) {
-#define PPU_VRC5FETCH
-			for (X1 = firsttile; X1 < lasttile; X1++) {
-#include "pputile.inc"
+			else if (MMC5HackCHRMode == 1 && (MMC5HackSPMode & 0x80)) {
+				int tochange = MMC5HackSPMode & 0x1F;
+				tochange -= firsttile;
+
+	#define PPUT_MMC5SP
+	#define PPUT_MMC5CHR1
+				for (X1 = firsttile; X1 < lasttile; X1++) {
+	#include "pputile.inc"
+				}
+	#undef PPUT_MMC5CHR1
+	#undef PPUT_MMC5SP
 			}
-#undef PPU_VRC5FETCH
+			else if (MMC5HackCHRMode == 1) {
+	#define PPUT_MMC5CHR1
+				for (X1 = firsttile; X1 < lasttile; X1++) {
+	#include "pputile.inc"
+				}
+	#undef PPUT_MMC5CHR1
+			}
+			else {
+				for (X1 = firsttile; X1 < lasttile; X1++) {
+	#include "pputile.inc"
+				}
+			}
+		}
+	#undef PPUT_MMC5
+		else if (PPU_hook) {
+			norecurse = 1;
+	#define PPUT_HOOK
+			if (PEC586Hack) {
+	#define PPU_BGFETCH
+				for (X1 = firsttile; X1 < lasttile; X1++) {
+	#include "pputile.inc"
+				}
+	#undef PPU_BGFETCH
+			}
+			else {
+				for (X1 = firsttile; X1 < lasttile; X1++) {
+	#include "pputile.inc"
+				}
+			}
+	#undef PPUT_HOOK
+			norecurse = 0;
 		}
 		else {
-			for (X1 = firsttile; X1 < lasttile; X1++) {
-#include "pputile.inc"
+			if (PEC586Hack) {
+	#define PPU_BGFETCH
+				for (X1 = firsttile; X1 < lasttile; X1++) {
+	#include "pputile.inc"
+				}
+	#undef PPU_BGFETCH
+			} if (QTAIHack) {
+	#define PPU_VRC5FETCH
+				for (X1 = firsttile; X1 < lasttile; X1++) {
+	#include "pputile.inc"
+				}
+	#undef PPU_VRC5FETCH
+			}
+			else {
+				for (X1 = firsttile; X1 < lasttile; X1++) {
+	#include "pputile.inc"
+				}
 			}
 		}
 	}
@@ -1331,16 +1684,28 @@ static void RefreshLine(int lastpixel) {
 	RefreshAddr = smorkus;
 	if (firsttile <= 2 && 2 < lasttile && !BGLeft8) {
 		uint32 tem;
-		tem = READPAL(0) | (READPAL(0) << 8) | (READPAL(0) << 16) | (READPAL(0) << 24);
-		tem |= 0x40404040;
+		if (vtrender) {
+			tem = 0;
+			memset(VTBGVisible, 0, 8);
+			memset(VT369DirectPixel, 0, 8);
+			memset(VT369RawColor, 0, 8 * sizeof(VT369RawColor[0]));
+		}
+		else {
+			tem = READPAL(0) | (READPAL(0) << 8) | (READPAL(0) << 16) | (READPAL(0) << 24);
+			tem |= 0x40404040;
+		}
 		*(uint32*)Plinef = *(uint32*)(Plinef + 4) = tem;
 	}
 
 	if (!ScreenON) {
 		uint32 tem;
 		int tstart, tcount;
-		tem = READPAL(0) | (READPAL(0) << 8) | (READPAL(0) << 16) | (READPAL(0) << 24);
-		tem |= 0x40404040;
+		if (vtrender)
+			tem = 0;
+		else {
+			tem = READPAL(0) | (READPAL(0) << 8) | (READPAL(0) << 16) | (READPAL(0) << 24);
+			tem |= 0x40404040;
+		}
 
 		tcount = lasttile - firsttile;
 		tstart = firsttile - 2;
@@ -1348,8 +1713,14 @@ static void RefreshLine(int lastpixel) {
 			tcount += tstart;
 			tstart = 0;
 		}
-		if (tcount > 0)
+		if (tcount > 0) {
 			FCEU_dwmemset(Plinef + tstart * 8, tem, tcount * 8);
+			if (vtrender) {
+				memset(VTBGVisible + tstart * 8, 0, tcount * 8);
+				memset(VT369DirectPixel + tstart * 8, 0, tcount * 8);
+				memset(VT369RawColor + tstart * 8, 0, tcount * 8 * sizeof(VT369RawColor[0]));
+			}
+		}
 	}
 
 	if (lastpixel >= TOFIXNUM && tofix) {
@@ -1416,47 +1787,123 @@ static void DoLine(void) {
 	EndRL();
 
 	if (!renderbg) {// User asked to not display background data.
-		uint32 tem;
-		uint8 col;
-		if (gNoBGFillColor == 0xFF)
-			col = READPAL(0);
-		else col = gNoBGFillColor;
-		tem = col | (col << 8) | (col << 16) | (col << 24);
-		tem |= 0x40404040;
-		FCEU_dwmemset(target, tem, 256);
+		if (VTRendererActive()) {
+			memset(target, 0, 256);
+			memset(VTBGVisible, 0, sizeof(VTBGVisible));
+			memset(VT369DirectPixel, 0, sizeof(VT369DirectPixel));
+			memset(VT369RawColor, 0, sizeof(VT369RawColor));
+		}
+		else {
+			uint32 tem;
+			uint8 col;
+			if (gNoBGFillColor == 0xFF)
+				col = READPAL(0);
+			else col = gNoBGFillColor;
+			tem = col | (col << 8) | (col << 16) | (col << 24);
+			tem |= 0x40404040;
+			FCEU_dwmemset(target, tem, 256);
+		}
 	}
 
 	if (SpriteON)
 		CopySprites(target);
 
-	// Stage 3.6.6c v1.1: keep the successful DoLine merged post-process.
-	const uint8 stage366cVisualMask = PPUMASK_VISUAL;
-	const uint8 stage366cDeemph = stage366cVisualMask >> 5;
-	const uint32 stage366cDeemphWord = (uint32)stage366cDeemph * 0x01010101U;
-
-	// greyscale handling (same ordering as before)
-	if ((ScreenON || SpriteON) && (stage366cVisualMask & 0x01)) {
-		for (x = 63; x >= 0; x--)
-			*(uint32*)&target[x << 2] &= 0x30303030;
-	}
-
-	// Apply palette emphasis and write XDBuf in the same 64-dword pass.
-	if (stage366cDeemph == 0x7) {
-		for (x = 63; x >= 0; x--) {
-			*(uint32*)&target[x << 2] = ((*(uint32*)&target[x << 2]) & 0x3f3f3f3f) | 0xc0c0c0c0;
-			*(uint32*)&dtarget[x << 2] = stage366cDeemphWord;
+	const int vtRenderer = VTRendererActive();
+	int vt369Color = 0;
+	/* Fast-forward R1: only a VT369 board can produce direct RGB555 pixels.
+	 * Do not scan 256 VT-only flags on every scanline of ordinary NES games. */
+	if (FFCEUX_PPUGetVT369Mode) {
+		for (x = 0; x < 256; ++x) {
+			if (VT369DirectPixel[x]) { vt369Color = 1; break; }
 		}
 	}
-	else if (stage366cVisualMask & 0xE0) {
-		for (x = 63; x >= 0; x--) {
-			*(uint32*)&target[x << 2] |= 0x40404040;
-			*(uint32*)&dtarget[x << 2] = stage366cDeemphWord;
+	const int vtCompositeColor = (vtRenderer && (VTMode() & 0x80)) || vt369Color;
+	/* VT32 packed owns the full indexed line. VT369 Stage 2.4.1 is different:
+	 * direct RGB555 ownership is tracked per pixel so raster-split/HUD regions
+	 * can remain in the ordinary NES palette domain on the same scanline. */
+	const int vtPackedColor = (vtCompositeColor && VT32PackedMode()) || vt369Color;
+	if (vt369Color) FCEU_VT369FrameDirectColor = 1;
+	if (vtRenderer && !vtCompositeColor) {
+		/* Old/compatible VT color mode still uses ordinary 2C02 6-bit colors.
+		 * Resolve the 7-bit CGRAM pen first, then run the normal FCEUX
+		 * grayscale/emphasis/output encoding.  Do NOT consume palette slots
+		 * $80-$FF: the emulator OSD uses those same entries (e.g. FPS=0xA0). */
+		for (x = 0; x < 256; ++x) {
+			const uint8 pen = target[x] & 0x7F;
+			target[x] = FFCEUX_PPUMapExtPalette ? (FFCEUX_PPUMapExtPalette(pen) & 0x3F) : (pen & 0x3F);
+		}
+	}
+
+	if (vtCompositeColor) {
+		if (vtPackedColor) {
+			if (vt369Color) {
+				/* Encode only pixels that were actually produced by the VT369
+				 * enhanced renderer. XDBuf bit7 is the direct-RGB555 domain flag;
+				 * bits0..2 hold index bits 6..8. Pixels outside that domain keep
+				 * the ordinary NES palette/emphasis encoding, which fixes HUD
+				 * recolouring and mode/raster-split bands. */
+				const uint8 visualMask = PPUMASK_VISUAL;
+				const uint8 deemph = visualMask >> 5;
+				for (x = 0; x < 256; ++x) {
+					if (VT369DirectPixel[x]) {
+						/* XBuf carries RGB555 bits 0..7; XDBuf bits0..6 carry
+						 * bits8..14 and bit7 marks the direct-colour domain. */
+						const uint16 rgb555 = VT369RawColor[x] & 0x7FFF;
+						target[x] = (uint8)(rgb555 & 0xFF);
+						dtarget[x] = (uint8)(0x80 | ((rgb555 >> 8) & 0x7F));
+					}
+					else {
+						uint8 p = target[x];
+						if ((ScreenON || SpriteON) && (visualMask & 0x01)) p &= 0x30;
+						if (deemph == 0x07) p = (uint8)((p & 0x3F) | 0xC0);
+						else if (visualMask & 0xE0) p = (uint8)(p | 0x40);
+						else p = (uint8)((p & 0x3F) | 0x80);
+						target[x] = p;
+						dtarget[x] = deemph;
+					}
+				}
+			}
+			else {
+				/* VT32 packed owns 256 indexed pens but has one palette space. */
+				for (x = 0; x < 256; ++x) dtarget[x] = 0;
+			}
+		}
+		else {
+			/* Ordinary VT03/VT09/VT32 COLCOMP uses 128 extended pens. */
+			for (x = 0; x < 256; ++x) {
+				target[x] = (uint8)(0x80 | (target[x] & 0x7F));
+				dtarget[x] = 0;
+			}
 		}
 	}
 	else {
-		for (x = 63; x >= 0; x--) {
-			*(uint32*)&target[x << 2] = ((*(uint32*)&target[x << 2]) & 0x3f3f3f3f) | 0x80808080;
-			*(uint32*)&dtarget[x << 2] = stage366cDeemphWord;
+		// Stage 3.6.6c v1.1: keep the successful DoLine merged post-process.
+		const uint8 stage366cVisualMask = PPUMASK_VISUAL;
+		const uint8 stage366cDeemph = stage366cVisualMask >> 5;
+		const uint32 stage366cDeemphWord = (uint32)stage366cDeemph * 0x01010101U;
+
+		if ((ScreenON || SpriteON) && (stage366cVisualMask & 0x01)) {
+			for (x = 63; x >= 0; x--)
+				*(uint32*)&target[x << 2] &= 0x30303030;
+		}
+
+		if (stage366cDeemph == 0x7) {
+			for (x = 63; x >= 0; x--) {
+				*(uint32*)&target[x << 2] = ((*(uint32*)&target[x << 2]) & 0x3f3f3f3f) | 0xc0c0c0c0;
+				*(uint32*)&dtarget[x << 2] = stage366cDeemphWord;
+			}
+		}
+		else if (stage366cVisualMask & 0xE0) {
+			for (x = 63; x >= 0; x--) {
+				*(uint32*)&target[x << 2] |= 0x40404040;
+				*(uint32*)&dtarget[x << 2] = stage366cDeemphWord;
+			}
+		}
+		else {
+			for (x = 63; x >= 0; x--) {
+				*(uint32*)&target[x << 2] = ((*(uint32*)&target[x << 2]) & 0x3f3f3f3f) | 0x80808080;
+				*(uint32*)&dtarget[x << 2] = stage366cDeemphWord;
+			}
 		}
 	}
 
@@ -1465,24 +1912,41 @@ static void DoLine(void) {
 	if (ScreenON || SpriteON)
 		FetchSpriteData();
 
+	/* Stage 2.4.9: VT369 raster handlers frequently write $2005/$2006 and
+	 * packed-resource registers from the OneBus timer IRQ.  The old FCEUX order
+	 * performed Fixit2() before asserting/servicing that IRQ, so horizontal
+	 * scroll written by the handler was not copied into RefreshAddr until the
+	 * following HBlank -- exactly a one-scanline late split.  Keep the historical
+	 * ordering for every other console, but for VT369 defer the horizontal reload
+	 * until after the HBlank CPU slice has had a chance to run the IRQ handler. */
+	const int vt369RasterTiming = (FFCEUX_PPUReadVT369Reg != 0);
 	if (GameHBIRQHook && (ScreenON || SpriteON) && ((PPU[0] & 0x38) != 0x18)) {
 		X6502_Run(6);
-		Fixit2();
+		if (!vt369RasterTiming) Fixit2();
 		X6502_Run(4);
 		GameHBIRQHook();
 		X6502_Run(85 - 16 - 10);
+		if (vt369RasterTiming) Fixit2();
 	}
 	else {
 		X6502_Run(6);	// Tried 65, caused problems with Slalom(maybe others)
-		Fixit2();
+		if (!vt369RasterTiming) Fixit2();
 		X6502_Run(85 - 6 - 16);
 
 		// A semi-hack for Star Trek: 25th Anniversary
 		if (GameHBIRQHook && (ScreenON || SpriteON) && ((PPU[0] & 0x38) != 0x18))
 			GameHBIRQHook();
+		if (vt369RasterTiming) Fixit2();
 	}
 
 	DEBUG(FCEUD_UpdateNTView(scanline, 0));
+
+	/* Stage 2.4.5: capture VT369 NEXT-line sprites only after the HBlank CPU
+	 * slice has serviced the OneBus raster IRQ.  This lets split handlers change
+	 * CHR/palette/OAM state for the very next line instead of one line late. */
+	if (SpriteON && VT369RendererActive() && FFCEUX_PPUReadVT369OAM &&
+		FFCEUX_PPUReadVT369Sprite)
+		VT369PrefetchSprites(scanline + 1);
 
 	if (SpriteON)
 		RefreshSprites();
@@ -1520,6 +1984,18 @@ static void FetchSpriteData(void) {
 	int vofs;
 	uint8 P0 = PPU[0];
 
+	/* VT369 enhanced OAM cannot fit the classic 64-entry SPRBUF.  Do not
+	 * prefetch it here: the OneBus timer IRQ runs during HBlank and many VT369
+	 * multicarts switch CHR/OAM/palette state from that handler.  Prefetching
+	 * before the handler freezes the OLD band for one extra scanline and creates
+	 * the characteristic one-line streak at raster-split boundaries.  Stage
+	 * 2.4.5 performs the private VT369 prefetch after the HBlank CPU slice. */
+	if (VT369RendererActive() && FFCEUX_PPUReadVT369OAM && FFCEUX_PPUReadVT369Sprite) {
+		numsprites = 0;
+		SpriteBlurp = 0;
+		return;
+	}
+
 	spr = (SPR*)SPRAM;
 	H = 8;
 
@@ -1527,6 +2003,73 @@ static void FetchSpriteData(void) {
 
 	vofs = (uint32)(P0 & 0x8 & (((P0 & 0x20) ^ 0x20) >> 2)) << 9;
 	H += (P0 & 0x20) >> 2;
+
+	/* NRS VT32 packed mode has a separate 32x32-ish sprite fetch format.
+	 * It is not the VT03 2/4-plane sprite path: each pattern byte contains
+	 * two 4bpp pixels and the palette bank comes from OAM attribute D3..D0.
+	 * Keep this branch exact-mode-only so normal VT09/VT32 graphics retain
+	 * the already verified renderer. */
+	if (VT32PackedMode() && FFCEUX_PPUReadPackedSprite) {
+		for (n = 63; n >= 0; n--, spr++) {
+			int row = (int)scanline + 1 - spr->y;
+			if ((unsigned)row >= 32) continue;
+			if (ns >= 64) break;
+			if (n == 63) sb = 1;
+			if (spr->atr & V_FLIP) row ^= 31;
+			for (int bi = 0; bi < 16; ++bi) {
+				const uint8 packed = FFCEUX_PPUReadPackedSprite(spr->no, (uint8)row, (uint8)bi);
+				VT32PackedSpritePixels[ns][bi * 2 + 0] = packed & 0x0F;
+				VT32PackedSpritePixels[ns][bi * 2 + 1] = packed >> 4;
+			}
+			VT32PackedSpriteAttr[ns] = spr->atr;
+			VT32PackedSpriteX[ns] = spr->x;
+			ns++;
+		}
+		numsprites = ns;
+		SpriteBlurp = sb;
+		return;
+	}
+
+	/* VT03 needs the live sprite EVA and (optionally) four pattern planes.
+	 * Keep the ordinary path untouched for all non-VT rendering. */
+	if (VTRendererActive()) {
+		const uint8 mode = VTMode();
+		for (n = 63; n >= 0; n--, spr++) {
+			if ((uint32)(scanline - spr->y) >= H) continue;
+			if (ns >= maxsprites) { PPU_status |= 0x20; break; }
+			if (n == 63) sb = 1;
+
+			SPRB dst;
+			int t = (int)scanline - spr->y;
+			uint32 vadr;
+			if (Sprite16)
+				vadr = ((spr->no & 1) << 12) + ((spr->no & 0xFE) << 4);
+			else
+				vadr = (spr->no << 4) + vofs;
+			if (spr->atr & V_FLIP) {
+				vadr += 7; vadr -= t;
+				vadr += (P0 & 0x20) >> 1;
+				vadr -= t & 8;
+			}
+			else {
+				vadr += t; vadr += t & 8;
+			}
+
+			dst.ca[0] = FFCEUX_PPUReadPatternExt(vadr, spr->atr, 1, 0);
+			dst.ca[1] = FFCEUX_PPUReadPatternExt(vadr, spr->atr, 1, 1);
+			VTSpritePlane2[ns] = (mode & 0x04) ? FFCEUX_PPUReadPatternExt(vadr, spr->atr, 1, 2) : 0;
+			VTSpritePlane3[ns] = (mode & 0x04) ? FFCEUX_PPUReadPatternExt(vadr, spr->atr, 1, 3) : 0;
+			dst.x = spr->x;
+			dst.atr = spr->atr;
+			*(uint32*)&SPRBUF[ns << 2] = *(uint32*)&dst;
+			if (PPU_hook && ns < 8) { PPU_hook(0x2000); PPU_hook(vadr); }
+			ns++;
+		}
+		if (ns > 8) PPU_status |= 0x20;
+		numsprites = ns;
+		SpriteBlurp = sb;
+		return;
+	}
 
 	if (!PPU_hook)
 		for (n = 63; n >= 0; n--, spr++) {
@@ -1659,8 +2202,121 @@ static void RefreshSprites(void) {
 	int n;
 	SPRB* spr;
 
+	if (VT369RendererActive()) {
+		/* Prefetch was produced by FetchSpriteData() before HBlank.  Preserve
+		 * it for the next scanline instead of clearing spork because numsprites
+		 * intentionally remains zero for the private 512-byte VT369 OAM path. */
+		spork = VT369PrefetchAny ? 1 : 0;
+		return;
+	}
+
 	spork = 0;
 	if (!numsprites) return;
+
+	if (VT32PackedMode() && FFCEUX_PPUReadPackedSprite) {
+		memset(sprlinebuf, 0, 256);
+		memset(VTSpriteVisible, 0, sizeof(VTSpriteVisible));
+		memset(VTSpriteBehind, 0, sizeof(VTSpriteBehind));
+		for (n = numsprites - 1; n >= 0; --n) {
+			const uint8 atr = VT32PackedSpriteAttr[n];
+			const int x = VT32PackedSpriteX[n];
+			const uint8 behind = (atr & SP_BACK) ? 1 : 0;
+			if (n == 0 && SpriteBlurp && !(PPU_status & 0x40)) {
+				uint8 mask = 0;
+				for (int sx = 0; sx < 8; ++sx)
+					if (VT32PackedSpritePixels[n][sx]) mask |= (uint8)(0x80 >> sx);
+				if (mask) { sphitx = x; sphitdata = mask; }
+			}
+			for (int sx = 0; sx < 32; ++sx) {
+				const uint8 pix = VT32PackedSpritePixels[n][sx];
+				if (!pix) continue;
+				/* NRS's VT32 path does not apply horizontal flip here; preserve
+				 * that observed hardware-model behavior rather than borrowing
+				 * VT03 sprite semantics. */
+				const int pos = x + sx;
+				if ((unsigned)pos < 256) {
+					sprlinebuf[pos] = (uint8)(pix | ((atr & 0x0F) << 4));
+					VTSpriteVisible[pos] = 1;
+					VTSpriteBehind[pos] = behind;
+				}
+			}
+		}
+		SpriteBlurp = 0;
+		spork = 1;
+		return;
+	}
+
+	if (VTRendererActive()) {
+		const uint8 mode = VTMode();
+		memset(sprlinebuf, 0, 256);
+		memset(VTSpriteVisible, 0, sizeof(VTSpriteVisible));
+		memset(VTSpriteBehind, 0, sizeof(VTSpriteBehind));
+		int last = numsprites - 1;
+		spr = (SPRB*)SPRBUF + last;
+		for (n = last; n >= 0; --n, --spr) {
+			const uint8 p0 = spr->ca[0], p1 = spr->ca[1];
+			const uint8 p2 = VTSpritePlane2[n], p3 = VTSpritePlane3[n];
+			const int sprite16pix = VTSpriteUses16Pixels(mode, spr->atr);
+			uint8 J = p0 | p1;
+			if (mode & 0x04) J |= p2 | p3;
+			if (!J) continue;
+
+			if (n == 0 && SpriteBlurp && !(PPU_status & 0x40)) {
+				sphitx = spr->x;
+				sphitdata = J;
+				if (spr->atr & H_FLIP) {
+					sphitdata = ((J << 7) & 0x80) | ((J << 5) & 0x40) |
+					((J << 3) & 0x20) | ((J << 1) & 0x10) |
+					((J >> 1) & 0x08) | ((J >> 3) & 0x04) |
+					((J >> 5) & 0x02) | ((J >> 7) & 0x01);
+				}
+			}
+
+			const uint8 group = (uint8)((spr->atr & 3) << 2);
+			const uint8 behind = (spr->atr & SP_BACK) ? 1 : 0;
+			for (int sx = 0; sx < 8; ++sx) {
+				const uint8 bit = (uint8)(0x80 >> sx);
+				const int dx = (spr->atr & H_FLIP) ? (7 - sx) : sx;
+				uint8 lo = (p0 & bit ? 1 : 0) | (p1 & bit ? 2 : 0);
+				if ((mode & 0x04) && !sprite16pix) {
+					uint8 pen = lo;
+					if (p2 & bit) pen |= 0x20;
+					if (p3 & bit) pen |= 0x40;
+					if (pen & 0x63) {
+						int pos = spr->x + dx;
+						if ((unsigned)pos < 256) {
+							sprlinebuf[pos] = (uint8)(pen | group | 0x10);
+							VTSpriteVisible[pos] = 1; VTSpriteBehind[pos] = behind;
+						}
+					}
+				}
+				else {
+					/* 2bpp sprites, and PIX16EN where planes 2/3 form the
+					 * horizontally adjacent second 8-pixel half. */
+					if (lo) {
+						int pos = spr->x + ((spr->atr & H_FLIP) && sprite16pix ? 8 + dx : dx);
+						if ((unsigned)pos < 256) {
+							sprlinebuf[pos] = (uint8)(lo | group | 0x10);
+							VTSpriteVisible[pos] = 1; VTSpriteBehind[pos] = behind;
+						}
+					}
+					if ((mode & 0x04) && sprite16pix) {
+						uint8 hi = (p2 & bit ? 1 : 0) | (p3 & bit ? 2 : 0);
+						if (hi) {
+							int pos = spr->x + ((spr->atr & H_FLIP) ? dx : 8 + dx);
+							if ((unsigned)pos < 256) {
+								sprlinebuf[pos] = (uint8)(hi | group | 0x10);
+								VTSpriteVisible[pos] = 1; VTSpriteBehind[pos] = behind;
+							}
+						}
+					}
+				}
+			}
+		}
+		SpriteBlurp = 0;
+		spork = 1;
+		return;
+	}
 
 	FCEU_dwmemset(sprlinebuf, 0x80808080, 256);
 	numsprites--;
@@ -1774,8 +2430,187 @@ static void RefreshSprites(void) {
 	spork = 1;
 }
 
+/* Compose VT369 enhanced sprites directly from the board's 512-byte OAM.
+ * The enhanced engine can expose 64/128 sprites and two OAM layouts, so the
+ * classic 64-entry SPRBUF cannot represent it faithfully.  Lower OAM index
+ * wins; a behind-BG sprite still claims the sprite pixel, matching NES-style
+ * priority selection before background priority is applied. */
+static void VT369PrefetchHiResSprites(int targetScanline) {
+	if (!VT369RendererActive() || !(VT369Mode() & 0x08) || !FFCEUX_PPUReadVT369OAM || !FFCEUX_PPUReadVT369HiResSprite) return;
+	uint8 claimed[256];
+	memset(claimed, 0, sizeof(claimed));
+
+	/* High-res OAM is 64 entries x 8 bytes.  Capture resource pixels now so
+	 * later HBlank register/bank writes cannot retroactively alter this row. */
+	for (int n = 0; n < 64; ++n) {
+		const uint16 o = (uint16)(n * 8);
+		const int ypos = FFCEUX_PPUReadVT369OAM(o + 0);
+		const uint16 tile = (uint16)FFCEUX_PPUReadVT369OAM(o + 1) | ((uint16)FFCEUX_PPUReadVT369OAM(o + 2) << 8);
+		const uint8 fmt = FFCEUX_PPUReadVT369OAM(o + 3);
+		const uint8 attr = FFCEUX_PPUReadVT369OAM(o + 6);
+		const int xpos = FFCEUX_PPUReadVT369OAM(o + 7);
+		const int bpp = (fmt & 0x80) ? 8 : 4;
+		const int width = 4 << ((fmt >> 4) & 3);
+		const int height = 4 << ((fmt >> 2) & 3);
+		const uint8 pal = attr & 0x3F;
+		int row = targetScanline - ypos;
+		if (row < 0 || row >= height) continue;
+
+		for (int px = 0; px < width; ++px) {
+			const int screenx = xpos + px;
+			if ((unsigned)screenx >= 256 || claimed[screenx]) continue;
+			const uint8 raw = FFCEUX_PPUReadVT369HiResSprite(tile, (uint8)width, (uint8)height,
+				(uint8)row, (uint8)px, (uint8)bpp);
+			if (!raw) continue;
+			claimed[screenx] = 1;
+			VT369PrefetchPixel[screenx] = (bpp == 8) ? raw : (uint8)(((pal & 0x0F) << 4) | (raw & 0x0F));
+			VT369PrefetchVisible[screenx] = 1;
+			VT369PrefetchBehind[screenx] = 0;
+			VT369PrefetchSprite0[screenx] = (n == 0) ? 1 : 0;
+			VT369PrefetchAny = 1;
+		}
+	}
+}
+
+static void VT369PrefetchSprites(int targetScanline) {
+	memset(VT369PrefetchPixel, 0, sizeof(VT369PrefetchPixel));
+	memset(VT369PrefetchVisible, 0, sizeof(VT369PrefetchVisible));
+	memset(VT369PrefetchBehind, 0, sizeof(VT369PrefetchBehind));
+	memset(VT369PrefetchSprite0, 0, sizeof(VT369PrefetchSprite0));
+	VT369PrefetchAny = 0;
+	VT369PrefetchLine = targetScanline;
+
+	if (!VT369RendererActive() || !FFCEUX_PPUReadVT369OAM) return;
+	if (VT369Mode() & 0x08) {
+		VT369PrefetchHiResSprites(targetScanline);
+		return;
+	}
+	if (!FFCEUX_PPUReadVT369Sprite) return;
+
+	const uint8 r1c = FFCEUX_PPUReadVT369Reg ? FFCEUX_PPUReadVT369Reg(0x0C) : 0;
+	const uint8 r1d = FFCEUX_PPUReadVT369Reg ? FFCEUX_PPUReadVT369Reg(0x0D) : 0;
+	const uint8 r1e = FFCEUX_PPUReadVT369Reg ? FFCEUX_PPUReadVT369Reg(0x0E) : 0;
+	const int expanded = (r1e & 0x04) ? 1 : 0;
+	uint8 claimed[256];
+	memset(claimed, 0, sizeof(claimed));
+
+	/* VT3xx standard-resolution enhanced OAM always exposes 0x80 sprite
+	 * entries.  In the old packed layout that is 128 x 4 = 512 bytes; in the
+	 * expanded layout the same 128 entries are split across four 0x80 tables.
+	 * $201D.0 is not a 64/128 sprite-count selector. */
+	const int spriteCount = 128;
+	for (int n = 0; n < spriteCount; ++n) {
+		const uint16 yoff = expanded ? (uint16)n : (uint16)(n * 4 + 0);
+		const uint16 toff = expanded ? (uint16)(0x080 + n) : (uint16)(n * 4 + 1);
+		const uint16 eoff = expanded ? (uint16)(0x100 + n) : (uint16)(n * 4 + 2);
+		const uint16 xoff = expanded ? (uint16)(0x180 + n) : (uint16)(n * 4 + 3);
+		int ypos = FFCEUX_PPUReadVT369OAM(yoff);
+		int xpos = FFCEUX_PPUReadVT369OAM(xoff);
+		uint16 tile = FFCEUX_PPUReadVT369OAM(toff);
+		const uint8 extra = FFCEUX_PPUReadVT369OAM(eoff);
+		tile |= (uint16)(extra & 0x1C) << 6;
+
+		uint8 pal = extra & 0x03;
+		int behind = 0, flipx = 0, flipy = 0;
+		if (r1d & 0x08) {
+			pal |= (extra & 0x20) >> 3;
+			if (extra & 0x40) xpos -= 0x100;
+			if (extra & 0x80) ypos -= 0x100;
+		}
+		else {
+			/* Match the current VT3xx reference implementation: format 1 uses
+			 * bit 5 for BG priority.  Although bits 6/7 are documented/commented
+			 * as X/Y flip in some notes, the standard-res renderer used by the
+			 * known-good D9/D12 path does not apply those flips. */
+			behind = (extra & 0x20) ? 1 : 0;
+			flipx = 0;
+			flipy = 0;
+		}
+
+		int height, width, bpp, alt16 = 0;
+		if (expanded) {
+			height = 16; width = 8; bpp = 8;
+			if (r1d & 0x02) { width = 16; bpp = 4; }
+			if (!(r1d & 0x04) && (r1c & 0x10)) { alt16 = 1; bpp = 4; }
+		}
+		else {
+			height = (PPU[0] & 0x20) ? 16 : 8;
+			width = 8; bpp = 8;
+			if (r1c == 0x12 && r1d == 0x0F && r1e == 0x0B) {
+				bpp = 4; width = 16; height = 16;
+			}
+		}
+
+		/* VT3xx packed OBJ is not the ordinary NES planar 8x16 path.  $2000.5
+		 * may still select an 8/16-pixel height in the old packed OAM format,
+		 * but tile bit 0 remains part of the packed tile number and does not
+		 * select a pattern table. */
+		const uint8 rightTable = 0;
+
+		int row = targetScanline - ypos;
+		if (row < 0 || row >= height) continue;
+		if (flipy) row = height - 1 - row;
+		for (int px = 0; px < width; ++px) {
+			const int screenx = xpos + px;
+			if ((unsigned)screenx >= 256 || claimed[screenx]) continue;
+			const int srcx = flipx ? (width - 1 - px) : px;
+			const uint8 raw = FFCEUX_PPUReadVT369Sprite(tile, (uint8)row, (uint8)srcx,
+				(uint8)bpp, (uint8)alt16, rightTable);
+			if (!raw) continue;
+			claimed[screenx] = 1;
+			VT369PrefetchPixel[screenx] = (bpp == 8) ? raw : (uint8)(((pal & 7) << 4) | (raw & 0x0F));
+			VT369PrefetchVisible[screenx] = 1;
+			VT369PrefetchBehind[screenx] = behind ? 1 : 0;
+			VT369PrefetchSprite0[screenx] = (n == 0) ? 1 : 0;
+			VT369PrefetchAny = 1;
+		}
+	}
+}
+
+static void VT369ComposePrefetchedSprites(uint8* target) {
+	if (!VT369RendererActive()) return;
+	/* Stage 2.4.9: never reconstruct the CURRENT row at EndRL.  A live fallback
+	 * here observes the post-split CHR/OAM/palette state and retroactively draws
+	 * it into a row whose sprite fetch window has already passed, producing the
+	 * characteristic one-line streak on mode/raster boundaries.  If enhanced
+	 * rendering was enabled too late to have a frozen row, leave sprites absent
+	 * for that transition row; the normal post-IRQ HBlank prefetch supplies the
+	 * following row with coherent state. */
+	if (VT369PrefetchLine != scanline) {
+		memset(VTSpriteVisible, 0, sizeof(VTSpriteVisible));
+		memset(VTSpriteBehind, 0, sizeof(VTSpriteBehind));
+		return;
+	}
+
+	memset(VTSpriteVisible, 0, sizeof(VTSpriteVisible));
+	memset(VTSpriteBehind, 0, sizeof(VTSpriteBehind));
+	int any = 0;
+	for (int x = 0; x < 256; ++x) {
+		if (!VT369PrefetchVisible[x]) continue;
+		if (x < 8 && !SpriteLeft8) continue;
+		if (VT369PrefetchSprite0[x] && x < 255 && VTBGVisible[x]) PPU_status |= 0x40;
+		VTSpriteVisible[x] = 1;
+		VTSpriteBehind[x] = VT369PrefetchBehind[x];
+		if (VT369PrefetchBehind[x] && VTBGVisible[x]) continue;
+		if (!rendersprites) continue;
+		target[x] = VT369PrefetchPixel[x];
+		VT369OBJPixel[x] = 1;
+		VT369DirectPixel[x] = 1;
+		VT369RawColor[x] = VT369SpriteRawValid[x]
+			? VT369SpriteRawColor[x]
+			: VT369SnapshotRGB555((uint16)VT369PrefetchPixel[x] + 256);
+		any = 1;
+	}
+	if (any) spork = 1;
+}
+
 static void CopySprites(uint8* target) {
 	uint8* P = target;
+
+	if (VT369RendererActive()) {
+		VT369ComposePrefetchedSprites(target);
+		return;
+	}
 
 	if (!spork) return;
 	spork = 0;
@@ -1785,6 +2620,16 @@ static void CopySprites(uint8* target) {
 	if (!SpriteON) return;
 
 	int start = 8;
+	if (SpriteLeft8) start = 0;
+
+	if (VTRendererActive()) {
+		for (int i = start; i < 256; ++i)
+			if (VTSpriteVisible[i] && (!VTSpriteBehind[i] || !VTBGVisible[i]))
+				P[i] = sprlinebuf[i];
+		return;
+	}
+
+	start = 8;
 	if (SpriteLeft8)
 		start = 0;
 
@@ -1819,6 +2664,26 @@ void FCEUPPU_Init(void) {
 
 void PPU_ResetHooks() {
 	FFCEUX_PPURead = FFCEUX_PPURead_Default;
+	FFCEUX_PPUReadCPU = NULL;
+	FFCEUX_PPUWriteCPU = NULL;
+	FFCEUX_PPUReadPatternExt = NULL;
+	FFCEUX_PPUGetPackedMode = NULL;
+	FFCEUX_PPUReadPackedBG = NULL;
+	FFCEUX_PPUReadPackedSprite = NULL;
+	FFCEUX_PPUGetExtMode = NULL;
+	FFCEUX_PPUMapExtPalette = NULL;
+	FFCEUX_PPUUseFixedOSD = NULL;
+	FFCEUX_PPURefreshExtPalette = NULL;
+	FFCEUX_PPUGetVT369Mode = NULL;
+	FFCEUX_PPUReadVT369Reg = NULL;
+	FFCEUX_PPUReadVT369BG = NULL;
+	FFCEUX_PPUReadVT369BG16 = NULL;
+	FFCEUX_PPUReadVT369Sprite = NULL;
+	FFCEUX_PPUReadVT369HiResSprite = NULL;
+	FFCEUX_PPUGetVT369SpriteConfig = NULL;
+	FFCEUX_PPUReadVT369OAM = NULL;
+	FFCEUX_PPUGetVT369OAMHigh = NULL;
+	FFCEUX_PPUWriteVT369OAM = NULL;
 }
 
 void FCEUPPU_Reset(void) {
@@ -1826,6 +2691,7 @@ void FCEUPPU_Reset(void) {
 	PPUSPL = 0;
 	PPUGenLatch = 0;
 	RefreshAddr = TempAddr = 0;
+	VT369DMAVRAMTarget = 0;
 	vtoggle = 0;
 	ppudead = 2;
 	kook = 0;
@@ -1872,6 +2738,10 @@ void FCEUPPU_Power(void) {
 }
 
 int FCEUPPU_Loop(int skip) {
+	/* Stage 2.4.6: start a new rendered-frame color-domain latch.  It remains
+	 * valid after this function returns so FCEU_PutImage() can composite HUD
+	 * using the actual frame history rather than the live VBlank $201E value. */
+	FCEU_VT369FrameDirectColor = 0;
 	if ((newppu) && (GameInfo->type != GIT_NSF)) {
 		int FCEUX_PPU_Loop(int skip);
 		return FCEUX_PPU_Loop(skip);
@@ -1932,6 +2802,12 @@ int FCEUPPU_Loop(int skip) {
 
 			//Clean this stuff up later.
 			spork = numsprites = 0;
+			VT369PrefetchAny = 0;
+			VT369PrefetchLine = -1;
+			if (VT369RendererActive()) {
+				VT369PrefetchSprites(0);
+				spork = VT369PrefetchAny ? 1 : 0;
+			}
 			ResetRL(XBuf);
 
 			X6502_Run(16 - kook);
@@ -2040,6 +2916,7 @@ SFORMAT FCEUPPU_STATEINFO[] = {
 	{ &vtoggle, 1, "VTGL" },
 	{ &RefreshAddrT, 2 | FCEUSTATE_RLSB, "RADD" },
 	{ &TempAddrT, 2 | FCEUSTATE_RLSB, "TADD" },
+	{ &VT369DMAVRAMTarget, 2 | FCEUSTATE_RLSB, "V3DT" },
 	{ &VRAMBuffer, 1, "VBUF" },
 	{ &PPUGenLatch, 1, "PGEN" },
 	{ 0 }
@@ -2313,7 +3190,7 @@ int FCEUX_PPU_Loop(int skip) {
 			g_rasterpos = 0;
 			ppur.status.sl = sl;
 
-			linestartts = timestamp * 48 + X.count; // pixel timestamp for debugger
+			linestartts = (int)(X6502_GetPPUTimestamp48() + X.count); // pixel timestamp for debugger
 
 			const int yp = sl - 1;
 			ppuphase = PPUPHASE_BG;

@@ -578,7 +578,7 @@ void  debuggerWin_t::updateRegisterView(void)
 	gtk_label_set_text( GTK_LABEL(sprite_label), stmp );
 
 	extern int linestartts;
-	#define GETLASTPIXEL    (PAL?((timestamp*48-linestartts)/15) : ((timestamp*48-linestartts)/16) )
+	#define GETLASTPIXEL    (PAL?((X6502_GetPPUTimestamp48()-(uint32)linestartts)/15) : ((X6502_GetPPUTimestamp48()-(uint32)linestartts)/16) )
 	
 	int ppupixel = GETLASTPIXEL;
 

@@ -30,6 +30,7 @@ DECLFR(VRC24_readWRAM);
 DECLFW(VRC24_writeWRAM);
 
 void VRC24_syncWRAM(int);
+void VRC24_setWRAMBytes(int bytes); // -1 default, or exact hybrid-visible byte count (0/2048/8192)
 void VRC24_syncPRG(int, int);
 void VRC24_syncCHR(int, int);
 int  VRC24_getPRGBank(uint8);

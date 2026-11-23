@@ -29,6 +29,7 @@
 #endif
 
 #include "palette.h"
+#include "drawing.h"
 #include "palettes/palettes.h"
 
 #ifndef M_PI
@@ -74,6 +75,8 @@ static void WritePalette(void);
 
 //points to the actually selected current palette
 pal *palo = NULL;
+pal FCEU_DirectPalette512[512];
+bool FCEU_DirectPalette512Enabled = false;
 
 #define RGB_TO_YIQ( r, g, b, y, i ) (\
 	(y = (r) * 0.299f + (g) * 0.587f + (b) * 0.114f),\
@@ -608,6 +611,9 @@ void WritePalette(void)
 	for(x=0;x<64;x++)
 		FCEUD_SetPalette(128+x,palo[x].r,palo[x].g,palo[x].b);
 	SetNESDeemph_OldHacky(lastd,1);
+	/* Preserve ordinary FCEUX HUD/output colours before VT03 COLCOMP may
+	 * repurpose palette entries $80-$FF. */
+	FCEU_CaptureOverlayPalette();
 	#ifdef _S9XLUA_H
 	FCEU_LuaUpdatePalette();
 	#endif

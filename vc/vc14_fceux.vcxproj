@@ -754,6 +754,7 @@ xcopy /y /d "$(ProjectDir)\..\src\drivers\win\7z_64.dll" "$(OutDir)"</Command>
     <ClCompile Include="..\src\boards\asic_mmc1.cpp" />
     <ClCompile Include="..\src\boards\asic_mmc2and4.cpp" />
     <ClCompile Include="..\src\boards\asic_mmc3.cpp" />
+    <ClCompile Include="..\src\boards\asic_mmc5.cpp" />
     <ClCompile Include="..\src\boards\asic_n118.cpp" />
     <ClCompile Include="..\src\boards\asic_pt8154.cpp" />
     <ClCompile Include="..\src\boards\asic_qj.cpp" />
@@ -832,10 +833,7 @@ xcopy /y /d "$(ProjectDir)\..\src\drivers\win\7z_64.dll" "$(OutDir)"</Command>
     <ClCompile Include="..\src\boards\vrc7.cpp" />
     <ClCompile Include="..\src\boards\vrc7p.cpp" />
     <ClCompile Include="..\src\boards\vrcirq.cpp" />
-    <ClCompile Include="..\src\boards\yhc-Axrom-Cart.cpp" />
-    <ClCompile Include="..\src\boards\Yhc-A_B_Uxrom-Cart.cpp" />
-    <ClCompile Include="..\src\boards\Yhc-Nrom_Cnrom-Cart.cpp" />
-    <ClCompile Include="..\src\boards\Yhc-Unrom-Cart.cpp" />
+    <ClCompile Include="..\src\boards\Yhc-Multicart.cpp" />
     <ClCompile Include="..\src\boards\yoko.cpp" />
     <ClCompile Include="..\src\boards\__dummy_mapper.cpp">
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">true</ExcludedFromBuild>
@@ -1347,6 +1345,7 @@ xcopy /y /d "$(ProjectDir)\..\src\drivers\win\7z_64.dll" "$(OutDir)"</Command>
     <ClInclude Include="..\src\boards\asic_mmc1.h" />
     <ClInclude Include="..\src\boards\asic_mmc2and4.h" />
     <ClInclude Include="..\src\boards\asic_mmc3.h" />
+    <ClInclude Include="..\src\boards\asic_mmc5.h" />
     <ClInclude Include="..\src\boards\asic_n118.h" />
     <ClInclude Include="..\src\boards\asic_pt8154.h" />
     <ClInclude Include="..\src\boards\asic_qj.h" />

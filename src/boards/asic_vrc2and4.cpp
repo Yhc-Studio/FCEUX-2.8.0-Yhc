@@ -26,6 +26,19 @@ static void (*VRC24_cbSync)();
 static int VRC24_A0, VRC24_A1;
 static int (*VRC24_cbGetPRGBank)(uint8_t);
 static int (*VRC24_cbGetCHRBank)(uint8_t);
+// On a hybrid cart, PRG chip $10 is a board-owned RAM backing.
+// Legacy standalone cartridges still use the global WRAMSize first.
+static int32 VRC24_forcedWRAMBytes = -1; // -1 = standalone/default geometry
+static uint32 VRC24_WRAMBytes(void) {
+    if (VRC24_forcedWRAMBytes >= 0) return (uint32)VRC24_forcedWRAMBytes;
+    return WRAMSize ? (uint32)WRAMSize : PRGsize[0x10];
+}
+
+void VRC24_setWRAMBytes(int bytes) {
+    // Hybrid multicarts may expose 0/2/8KiB from a larger shared backing.
+    // Passing -1 restores the original standalone-cart behavior.
+    VRC24_forcedWRAMBytes = bytes < 0 ? -1 : bytes;
+}
 static DECLFR((*VRC24_cbReadWRAM));
 static DECLFW((*VRC24_cbWriteWRAM));
 static DECLFW((*VRC24_cbExternalSelect));
@@ -58,6 +71,7 @@ static SFORMAT VRC24_stateRegs[] = {
 
 static SFORMAT VRC2_stateRegs[] = {
 	{ &VRC2_pins, 1, "VC2E" },
+	{ 0 }
 };
 
 static SFORMAT VRC4_stateRegs[] = {
@@ -104,16 +118,23 @@ void VRC24_syncMirror(void) {
 }
 
 DECLFR(VRC2_readMicrowire) {
-	return VRC2_pins;
+    // VRC2 exposes only the latch on D0; D7..D1 are open bus.  Contra (J),
+    // Ganbare Goemon 2 and Wai Wai World rely on reading the written bit back.
+    return (X.DB & 0xFE) | (VRC2_pins & 1);
 }
 
 DECLFR(VRC24_readWRAM) {
-	if (VRC24_misc & 1 || !VRC24_isVRC4 || WRAMSize >= 8192) {
+    const uint32 bytes = VRC24_WRAMBytes();
+    // Genuine VRC4's native 2KiB RAM decoder covers only $6000-$6FFF,
+    // mirrored once. $7000-$7FFF remains open bus. 8KiB boards use an
+    // external decoder and legitimately expose the full range.
+    if (VRC24_isVRC4 && bytes == 2048 && A >= 0x7000) return A >> 8;
+	if (VRC24_misc & 1 || !VRC24_isVRC4 || bytes >= 8192) {
 		if (VRC24_cbReadWRAM)
 			return VRC24_cbReadWRAM(A);
 		else
-			if (WRAMSize)
-				return CartBR(((A - 0x6000) & (WRAMSize - 1)) + 0x6000);
+			if (VRC24_WRAMBytes())
+				return CartBR(((A - 0x6000) & (VRC24_WRAMBytes() - 1)) + 0x6000);
 			else
 				return A >> 8;
 	}
@@ -127,9 +148,11 @@ DECLFW(VRC2_writeMicrowire) {
 }
 
 DECLFW(VRC24_writeWRAM) {
-	if (VRC24_misc & 1 || !VRC24_isVRC4 || WRAMSize >= 8192) {
-		if (WRAMSize)
-			CartBW(((A - 0x6000) & (WRAMSize - 1)) + 0x6000, V);
+    const uint32 bytes = VRC24_WRAMBytes();
+    if (VRC24_isVRC4 && bytes == 2048 && A >= 0x7000) return;
+	if (VRC24_misc & 1 || !VRC24_isVRC4 || bytes >= 8192) {
+		if (VRC24_WRAMBytes())
+			CartBW(((A - 0x6000) & (VRC24_WRAMBytes() - 1)) + 0x6000, V);
 		if (VRC24_cbWriteWRAM)
 			VRC24_cbWriteWRAM(A, V);
 	}
@@ -205,7 +228,7 @@ void VRC24_clear(void) {
 }
 
 static void VRC24_setHandlers() {
-	if (VRC24_isVRC4 || WRAMSize) {
+	if (VRC24_isVRC4 || VRC24_WRAMBytes()) {
 		SetReadHandler(0x6000, 0x7FFF, VRC24_readWRAM);
 		SetWriteHandler(0x6000, 0x7FFF, VRC24_writeWRAM);
 	}

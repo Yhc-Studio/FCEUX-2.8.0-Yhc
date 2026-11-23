@@ -35,15 +35,124 @@
 X6502 X;
 uint32 timestamp;
 uint32 soundtimestamp;
+uint8 encryptOpcodes = 0;
+uint8 encryptOpcodesConfig = 0;
+uint8 encryptOpcodesPending = 0;
+uint8 encryptOpcodesPendingMode = 0;
+
+// R4.2.1 debugger safety guard. CPU execution continues to use the actual
+// encryptOpcodes state below; this flag controls only debugger/disassembler
+// presentation. It is enabled exclusively by OneBus/VTxx board power/reset.
+static uint8 opcodeDebugDecryptionEnabled = 0;
+
+// VT369 main-CPU clock domain. FCEUX historically uses 48 internal timing
+// units per ordinary CPU cycle (16 units per NTSC PPU pixel). VT369 $411C.7
+// triples only the main CPU, so a fast CPU cycle consumes 16 timing units
+// while APU/sound time continues at the base clock.
+static uint8 oneBusClockMultiplier = 1;
+static uint8 oneBusSoundTimestampRemainder = 0;
+static uint8 oneBusSoundHookRemainder = 0;
+static uint32 ppuTimestamp48 = 0;
+
+void X6502_SetOneBusClockMultiplier(uint8 multiplier)
+{
+ multiplier = (multiplier == 3) ? 3 : 1;
+ if (oneBusClockMultiplier != multiplier)
+ {
+  oneBusClockMultiplier = multiplier;
+  // A transition is line-flushed by the OneBus register write. Discarding at
+  // most 2/3 of one base APU cycle is safer than carrying a remainder whose
+  // denominator changed across the clock boundary.
+  oneBusSoundTimestampRemainder = 0;
+  oneBusSoundHookRemainder = 0;
+ }
+}
+
+uint8 X6502_GetOneBusClockMultiplier(void)
+{
+ return oneBusClockMultiplier;
+}
+
+uint32 X6502_GetPPUTimestamp48(void)
+{
+ return ppuTimestamp48;
+}
+
+void X6502_SetOpcodeDebugDecryptionEnabled(uint8 enabled)
+{
+ opcodeDebugDecryptionEnabled = enabled ? 1 : 0;
+}
+
+uint8 X6502_IsOpcodeDebugDecryptionEnabled(void)
+{
+ return opcodeDebugDecryptionEnabled;
+}
+
+static INLINE uint8 X6502_DecodeOpcode(uint8 b1)
+{
+ // Fast-forward R1: ordinary NES software has no OneBus opcode transform.
+ // This is the overwhelmingly hot path, so return after a single predictable
+ // test instead of evaluating every VT/OneBus encryption mode per instruction.
+ const uint8 mode = encryptOpcodes;
+ if (!mode) return b1;
+
+ switch (mode)
+ {
+  case 15: // VT32 XOR A1
+   return (uint8)(b1 ^ 0xA1);
+  case 16: // VT32 XOR 7E
+   return (uint8)(b1 ^ 0x7E);
+  case 10:
+   return (uint8)(b1 & ~0x36 | b1 >> 1 & 0x12 | b1 << 1 & 0x24);
+  case 11:
+   if (encryptOpcodesConfig & 0x02)
+    b1 = (uint8)(b1 & ~0x30 | b1 >> 1 & 0x10 | b1 << 1 & 0x20);
+   if (encryptOpcodesConfig & 0x40)
+    b1 = (uint8)(b1 & ~0xC6 | b1 >> 1 & 0x42 | b1 << 1 & 0x84);
+   return b1;
+  case 12:
+   return (uint8)(b1 & ~0xC6 | b1 >> 1 & 0x42 | b1 << 1 & 0x84);
+  case 14:
+   return (uint8)(b1 & ~0xC0 | b1 >> 1 & 0x40 | b1 << 1 & 0x80);
+  case 17: // Stage 1 $4169: Taikee D1<->D4
+   return (uint8)((b1 & ~0x12) | ((b1 & 0x02) << 3) | ((b1 & 0x10) >> 3));
+  case 18: // Stage 1 $4169: Jungletac D5<->D6
+   return (uint8)((b1 & ~0x60) | ((b1 & 0x20) << 1) | ((b1 & 0x40) >> 1));
+  default:
+   return b1;
+ }
+}
+
+uint8 X6502_DecodeOpcodeForDebug(uint8 b1)
+{
+ if (!opcodeDebugDecryptionEnabled)
+  return b1;
+ return X6502_DecodeOpcode(b1);
+}
+
 void (*MapIRQHook)(int a);
 
 #define ADDCYC(x) \
 {                 \
  int __x=x;       \
  _tcount+=__x;    \
- _count-=__x*48;  \
  timestamp+=__x;  \
- if(!overclocking) soundtimestamp+=__x; \
+ /* Fast-forward R1: multiplier==1 is the normal NES/VT03/VT32 path.  The old \
+  * generic formula performed a runtime divide and modulo for EVERY CPU timing \
+  * update even when dividing by one.  Keep that work exclusively in VT369 3x. */ \
+ if(oneBusClockMultiplier==1) { \
+  _count-=__x*48; \
+  ppuTimestamp48+=(uint32)(__x*48); \
+  if(!overclocking) soundtimestamp+=(uint32)__x; \
+ } else { \
+  _count-=__x*16; \
+  ppuTimestamp48+=(uint32)(__x*16); \
+  if(!overclocking) { \
+   const int __st=(int)oneBusSoundTimestampRemainder+__x; \
+   soundtimestamp+=(uint32)(__st/3); \
+   oneBusSoundTimestampRemainder=(uint8)(__st%3); \
+  } \
+ } \
 }
 
 // FCEUX 2.7-style low-overhead hook lists.  These are intentionally null while
@@ -469,6 +578,12 @@ int X6502_GetOpcodeCycles( int op )
 	return CycTable[op];
 }
 
+void X6502_AddCycles(int cycles)
+{
+ if(cycles > 0)
+  ADDCYC(cycles);
+}
+
 void X6502_IRQBegin(int w)
 {
  _IRQlow|=w;
@@ -526,6 +641,9 @@ void X6502_Power(void)
  _count=_tcount=_IRQlow=_PC=_A=_X=_Y=_P=_PI=_DB=_jammed=0;
  _S=0xFD;
  timestamp=soundtimestamp=0;
+ ppuTimestamp48=0;
+ oneBusClockMultiplier=1;
+ oneBusSoundTimestampRemainder=oneBusSoundHookRemainder=0;
  X6502_Reset();
  StackAddrBackup = -1;
 }
@@ -619,8 +737,11 @@ extern int test; test++;
    }
 
    _PI=_P;
-   b1=RdMem(_PC);
+   b1=X6502_DecodeOpcode(RdMem(_PC));
 
+   /* Decode every OneBus protection mode before cycle lookup.  Older code
+    * decoded the bit-permutation modes after CycTable[], producing timing for
+    * the encrypted byte instead of the instruction that actually executes. */
    ADDCYC(CycTable[b1]);
 
    temp=_tcount;
@@ -628,15 +749,33 @@ extern int test; test++;
    if(MapIRQHook) MapIRQHook(temp);
    
    if (!overclocking)
-    FCEU_SoundCPUHook(temp);
+   {
+    int32 soundtemp = temp;
+    if (oneBusClockMultiplier == 3)
+    {
+     const int32 total = (int32)oneBusSoundHookRemainder + temp;
+     soundtemp = total / 3;
+     oneBusSoundHookRemainder = (uint8)(total % 3);
+    }
+    if (soundtemp > 0) FCEU_SoundCPUHook(soundtemp);
+   }
    if (execMemHook)
    {
        execMemHook->call(_PC, 0);
    }
    _PC++;
+
+   const uint8 executedOpcode = b1;
    switch(b1)
    {
     #include "ops.inc"
+   }
+   /* VT3x $411E changes opcode scrambling only after the next JMP has
+    * completed, so the JMP itself is decoded using the previous mode. */
+   if (encryptOpcodesPending && (executedOpcode == 0x4C || executedOpcode == 0x6C))
+   {
+    encryptOpcodes = encryptOpcodesPendingMode;
+    encryptOpcodesPending = 0;
    }
   }
   if (!Stage366bDebugPath)

@@ -1347,16 +1347,7 @@
     <ClCompile Include="..\src\boards\472.cpp">
       <Filter>boards</Filter>
     </ClCompile>
-    <ClCompile Include="..\src\boards\Yhc-A_B_Uxrom-Cart.cpp">
-      <Filter>boards</Filter>
-    </ClCompile>
-    <ClCompile Include="..\src\boards\yhc-Axrom-Cart.cpp">
-      <Filter>boards</Filter>
-    </ClCompile>
-    <ClCompile Include="..\src\boards\Yhc-Nrom_Cnrom-Cart.cpp">
-      <Filter>boards</Filter>
-    </ClCompile>
-    <ClCompile Include="..\src\boards\Yhc-Unrom-Cart.cpp">
+    <ClCompile Include="..\src\boards\Yhc-Multicart.cpp">
       <Filter>boards</Filter>
     </ClCompile>
     <ClCompile Include="..\src\boards\516.cpp">
@@ -2046,6 +2037,9 @@
     <ClCompile Include="..\src\boards\eeprom_24C0x.cpp">
       <Filter>boards</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\boards\asic_mmc5.cpp">
+      <Filter>boards</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\src\drivers\common\args.h">
@@ -2636,6 +2630,9 @@
       <Filter>boards</Filter>
     </ClInclude>
     <ClInclude Include="..\src\boards\eeprom_24C0x.h">
+      <Filter>boards</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\boards\asic_mmc5.h">
       <Filter>boards</Filter>
     </ClInclude>
   </ItemGroup>

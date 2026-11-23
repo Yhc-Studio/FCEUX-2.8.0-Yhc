@@ -982,7 +982,7 @@ void DebugCycle()
 		if ((_PC >= 0x3801) && (_PC <= 0x3824)) return;
 	}
 
-	opcode[0] = GetMem(_PC);
+	opcode[0] = X6502_DecodeOpcodeForDebug(GetMem(_PC));
 	size = opsize[opcode[0]];
 	switch (size)
 	{

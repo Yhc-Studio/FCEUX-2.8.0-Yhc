@@ -27,6 +27,7 @@
 #include "../../fceu.h"
 #include "../../types.h"
 #include "../../palette.h"
+#include "../../drawing.h"
 #include "../../utils/memory.h"
 #include "nes_ntsc.h"
 #include "video.h"
@@ -36,6 +37,7 @@ extern u8* XBackBuf;
 extern u8* XDBuf;
 extern u8* XDBackBuf;
 extern pal* palo;
+extern uint8 FCEU_VT369FrameDirectColor;
 
 #include "../../ppu.h"  // for PPU[]
 
@@ -43,7 +45,14 @@ nes_ntsc_t* nes_ntsc;
 uint8 burst_phase = 0;
 
 static uint32 CBM[3];
+static int vtHostShiftR[3] = {0,0,0};
+static int vtHostShiftL[3] = {0,0,0};
 static uint32* palettetranslate = 0;
+/* Stage 2.4.3: VT369 direct pixels carry their rendered 15-bit RGB555 value
+ * in XBuf/XDBuf, so palette RAM changes later in the frame cannot recolour
+ * earlier pixels.  This table converts all 32768 RGB555 values to the active
+ * host pixel format and is independent of the game's palette contents. */
+static uint32 vt369rgb555translate[0x8000];
 static int backBpp, backshiftr[3], backshiftl[3];
 static int silt;
 static int Bpp;	// BYTES per pixel
@@ -321,10 +330,33 @@ void SetPaletteBlitToHigh(uint8* src)
 	int cshiftl[3];
 
 	CalculateShift(CBM, cshiftr, cshiftl);
+	for (int i = 0; i < 3; ++i) {
+		vtHostShiftR[i] = cshiftr[i];
+		vtHostShiftL[i] = cshiftl[i];
+	}
+
+	/* Build direct RGB555 -> host-pixel translation once per output format. */
+	for (int raw = 0; raw < 0x8000; ++raw) {
+		const uint32 b5 = (uint32)(raw & 0x1F);
+		const uint32 g5 = (uint32)((raw >> 5) & 0x1F);
+		const uint32 r5 = (uint32)((raw >> 10) & 0x1F);
+		const uint32 r = (r5 << 3) | (r5 >> 2);
+		const uint32 g = (g5 << 3) | (g5 >> 2);
+		const uint32 b = (b5 << 3) | (b5 >> 2);
+		if (Bpp == 2) {
+			uint32 color = (r >> vtHostShiftR[0]) << vtHostShiftL[0];
+			color |= (g >> vtHostShiftR[1]) << vtHostShiftL[1];
+			color |= (b >> vtHostShiftR[2]) << vtHostShiftL[2];
+			vt369rgb555translate[raw] = color;
+		}
+		else {
+			vt369rgb555translate[raw] = (r << cshiftl[0]) | (g << cshiftl[1]) | (b << cshiftl[2]);
+		}
+	}
 
 	switch (Bpp)
 	{
-	case 2:
+	case 2: {
 		for (int x = 0; x < 256; x++)
 		{
 			uint32 r = src[x << 2];
@@ -336,14 +368,16 @@ void SetPaletteBlitToHigh(uint8* src)
 			palettetranslate[x] = color;
 		}
 
-		//full size deemph palette
-		if (palo)
+		// Full 512-color source: ordinary NES deemphasis palette, or VT369's
+		// independent 256 BG + 256 OBJ RGB555 palette.
+		pal* fullPalette = palo;
+		if (fullPalette)
 		{
 			for (int x = 0; x < 512; x++)
 			{
-				uint32 r = palo[x].r;
-				uint32 g = palo[x].g;
-				uint32 b = palo[x].b;
+				uint32 r = fullPalette[x].r;
+				uint32 g = fullPalette[x].g;
+				uint32 b = fullPalette[x].b;
 				u16 color = (r >> cshiftr[0]) << cshiftl[0];
 				color |= (g >> cshiftr[1]) << cshiftl[1];
 				color |= (b >> cshiftr[2]) << cshiftl[2];
@@ -352,9 +386,10 @@ void SetPaletteBlitToHigh(uint8* src)
 		}
 
 		break;
+	}
 
 	case 3:
-	case 4:
+	case 4: {
 		for (int x = 0; x < 256; x++)
 		{
 			uint32 r = src[x << 2];
@@ -363,20 +398,22 @@ void SetPaletteBlitToHigh(uint8* src)
 			palettetranslate[x] = (r << cshiftl[0]) | (g << cshiftl[1]) | (b << cshiftl[2]);
 		}
 
-		//full size deemph palette
-		if (palo)
+		// Full 512-color source: ordinary NES deemphasis palette, or VT369.
+		pal* fullPalette = palo;
+		if (fullPalette)
 		{
 			for (int x = 0; x < 512; x++)
 			{
-				uint32 r = palo[x].r;
-				uint32 g = palo[x].g;
-				uint32 b = palo[x].b;
+				uint32 r = fullPalette[x].r;
+				uint32 g = fullPalette[x].g;
+				uint32 b = fullPalette[x].b;
 				palettetranslate[256 + x] = (r << cshiftl[0]) | (g << cshiftl[1]) | (b << cshiftl[2]);
 			}
 		}
 
 		break;
 	}
+}
 }
 
 void Blit32to24(uint32* src, uint8* dest, int xr, int yr, int dpitch)
@@ -496,12 +533,32 @@ void Blit8To8(uint8* src, uint8* dest, int xr, int yr, int pitch, int xscale, in
 /* Todo:  Make sure 24bpp code works right with big-endian cpus */
 
 //takes a pointer to XBuf and applies fully modern deemph palettizing
+template<int SCALE> static INLINE u32 _ModernDeemphColorMapNormal(const u8* src, const u8* srcbuf)
+{
+	const u8 pixel = *src;
+	int ofs = src - srcbuf;
+	int xofs = ofs & 255;
+	int yofs = ofs >> 8;
+	xofs /= SCALE;
+	yofs /= SCALE;
+	ofs = xofs + yofs * 256;
+
+	u32 color = palettetranslate[pixel];
+	const uint8 deemph = XDBuf[ofs] & 7;
+	if (deemph != 0)
+		color = palettetranslate[256 + (pixel & 0x3F) + (deemph * 64)];
+	return color;
+}
+
 template<int SCALE> static u32 _ModernDeemphColorMap(const u8* src, const u8* srcbuf)
 {
-	u8 pixel = *src;
+	/* Fast-forward R1: the overwhelming majority of frames are ordinary NES
+	 * indexed colour.  Bypass all VT369 HUD/direct-RGB555 ownership work before
+	 * calling any overlay helper; this restores the pre-VT hot blitter shape. */
+	if (!FCEU_VT369FrameDirectColor)
+		return _ModernDeemphColorMapNormal<SCALE>(src, srcbuf);
 
-	//look up the legacy translation
-	u32 color = palettetranslate[pixel];
+	u8 pixel = *src;
 
 	int ofs = src - srcbuf;
 	int xofs = ofs & 255;
@@ -510,14 +567,36 @@ template<int SCALE> static u32 _ModernDeemphColorMap(const u8* src, const u8* sr
 	yofs /= SCALE;
 	ofs = xofs + yofs * 256;
 
-	//find out which deemph bitplane value we're on
-	uint8 deemph = XDBuf[ofs];
-
-	//if it was a deemph'd value, grab it from the deemph palette
-	if (deemph != 0)
-	{
-		color = palettetranslate[256 + (pixel & 0x3F) + (deemph * 64)];
+	/* Stage 2.4.5: emulator HUD/OSD has an independent RGB ownership plane.
+	 * Composite it before looking at the game's indexed/direct-color domain,
+	 * so OneBus palette writes can never recolour FCEUX text or icons. */
+	uint8 or_, og_, ob_;
+	if (FCEU_OverlayGetRGB(ofs, &or_, &og_, &ob_)) {
+		if (Bpp == 2) {
+			u32 color = (or_ >> vtHostShiftR[0]) << vtHostShiftL[0];
+			color |= (og_ >> vtHostShiftR[1]) << vtHostShiftL[1];
+			color |= (ob_ >> vtHostShiftR[2]) << vtHostShiftL[2];
+			return color;
+		}
+		return ((u32)or_ << vtHostShiftL[0]) | ((u32)og_ << vtHostShiftL[1]) | ((u32)ob_ << vtHostShiftL[2]);
 	}
+
+	/* XDBuf bit7 marks an actual VT369 RGB555 pixel.  Without that bit the
+	 * pixel remains in the ordinary FCEUX/NES palette domain. */
+	const uint8 side = XDBuf[ofs];
+	/* Stage 2.4.6: direct ownership is a property of this pixel, not the live
+	 * VT369 mode at frame end.  $201E may be cleared in VBlank before blit. */
+	const bool direct = (side & 0x80) != 0;
+
+	if (direct) {
+		const uint16 rgb555 = (uint16)pixel | ((uint16)(side & 0x7F) << 8);
+		return vt369rgb555translate[rgb555 & 0x7FFF];
+	}
+
+	u32 color = palettetranslate[pixel];
+	const uint8 deemph = side & 7;
+	if (deemph != 0)
+		color = palettetranslate[256 + (pixel & 0x3F) + (deemph * 64)];
 
 	return color;
 }
@@ -695,7 +774,7 @@ void Blit8ToHigh(uint8* src, uint8* dest, int xr, int yr, int pitch, int xscale,
 		}
 		return;
 	}
-	else if (palrgb)                 // pal moire
+	else if (palrgb && !FCEU_VT369FrameDirectColor) // pal moire; VT369 RGB555 is already direct color
 	{
 		// skip usual palette translation, fill lookup array of RGB+moire values per palette update, and send directly to DX dest
 		// written by feos in 2015, credits to HardWareMan and r57shell
@@ -897,7 +976,7 @@ void Blit8ToHigh(uint8* src, uint8* dest, int xr, int yr, int pitch, int xscale,
 			switch (Bpp)
 			{
 			case 4:
-				if (nes_ntsc && GameInfo && GameInfo->type != GIT_NSF) {
+				if (nes_ntsc && !FCEU_VT369FrameDirectColor && GameInfo && GameInfo->type != GIT_NSF) {
 					int outxr = 301 - (ClipSidesOffset ? 19 : 0);
 					//if(xr == 282) outxr = 282; //hack for windows
 					burst_phase ^= 1;

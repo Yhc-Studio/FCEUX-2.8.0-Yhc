@@ -4,6 +4,8 @@
 #include "video.h"
 #include "movie.h"
 #include "driver.h"
+#include "ppu.h"
+#include "palette.h"
 
 static uint8 Font6x7[792] =
 {
@@ -120,7 +122,7 @@ void DrawTextLineBG(uint8* dest)
 		for (x = offs; x < (256 - offs); x++)
 		{
 			// Choose the dimmest set of colours and then dim that
-			dest[y * 256 + x] = (dest[y * 256 + x] & 0x0F) | 0xC0;
+			FCEU_OverlayWritePixel(&dest[y * 256 + x], (uint8)((dest[y * 256 + x] & 0x0F) | 0xC0));
 		}
 	}
 }
@@ -316,7 +318,7 @@ static void drawstatus(uint8* XBuf, int n, int y, int xofs)
 		uint8* dest = XBuf + (y * 256);
 		int x;
 		for (x = slines[i + 1]; x != slines[i + 2]; ++x)
-			dest[x] = 0;
+			FCEU_OverlayWritePixel(&dest[x], 0);
 	}
 
 	XBuf -= 255;
@@ -326,7 +328,7 @@ static void drawstatus(uint8* XBuf, int n, int y, int xofs)
 		uint8* dest = XBuf + (y * 256);
 		int x;
 		for (x = slines[i + 1]; x != slines[i + 2]; ++x)
-			dest[x] = 4;
+			FCEU_OverlayWritePixel(&dest[x], 4);
 	}
 }
 
@@ -366,30 +368,314 @@ void FCEU_DrawNumberRow(uint8* XBuf, int* nstatus, int cur)
 			{
 				for (y = 0; y < 13; y++)
 					for (x = 0; x < 21; x++)
-						XBaf[y * 256 + x + z * 21 + z] = sstat[y * 21 + x + (z - 1) * 21 * 12] ^ 0x80;
+						FCEU_OverlayWritePixel(&XBaf[y * 256 + x + z * 21 + z], (uint8)(sstat[y * 21 + x + (z - 1) * 21 * 12] ^ 0x80));
 			}
 			else {
 				for (y = 0; y < 13; y++)
 					for (x = 0; x < 21; x++)
 						if (sstat[y * 21 + x + (z - 1) * 21 * 12] != 0x83)
-							XBaf[y * 256 + x + z * 21 + z] = sstat[y * 21 + x + (z - 1) * 21 * 12] ^ 0x80;
+							FCEU_OverlayWritePixel(&XBaf[y * 256 + x + z * 21 + z], (uint8)(sstat[y * 21 + x + (z - 1) * 21 * 12] ^ 0x80));
 
 						else
-							XBaf[y * 256 + x + z * 21 + z] = (XBaf[y * 256 + x + z * 21 + z] & 0xF) | 0xC0;
+							FCEU_OverlayWritePixel(&XBaf[y * 256 + x + z * 21 + z], (uint8)((XBaf[y * 256 + x + z * 21 + z] & 0xF) | 0xC0));
 			}
 			if (cur == z % 10)
 			{
 				for (x = 0; x < 21; x++)
-					XBaf[x + z * 21 + z * 1] = 4;
+					FCEU_OverlayWritePixel(&XBaf[x + z * 21 + z * 1], 4);
 				for (x = 1; x < 12; x++)
 				{
-					XBaf[256 * x + z * 21 + z * 1] =
-						XBaf[256 * x + z * 21 + z * 1 + 20] = 4;
+					FCEU_OverlayWritePixel(&XBaf[256 * x + z * 21 + z * 1], 4);
+					FCEU_OverlayWritePixel(&XBaf[256 * x + z * 21 + z * 1 + 20], 4);
 				}
 				for (x = 0; x < 21; x++)
-					XBaf[12 * 256 + x + z * 21 + z * 1] = 4;
+					FCEU_OverlayWritePixel(&XBaf[12 * 256 + x + z * 21 + z * 1], 4);
 			}
 		}
+}
+
+/* Stage4.2 VT03 renderer R4: preserve the exact FCEUX HUD colours while
+ * VT03 COLCOMP owns output palette entries $80-$FF.
+ *
+ * FCEUX normally draws its HUD using those same high palette entries. R3
+ * moved the HUD to the invariant low GUI colours, which avoided corruption
+ * but changed the HUD to a black/white approximation. R4 snapshots the
+ * ordinary FCEUX output palette before VT03 replaces it, then mirrors only
+ * the colours actually requested by the OSD into spare low palette slots.
+ * This keeps the original FCEUX palette selection, deemphasis and HUD colour
+ * scheme intact without colliding with VT03 CGRAM. */
+#define FCEU_OVERLAY_MIRROR_FIRST 23
+#define FCEU_OVERLAY_MIRROR_LAST  63
+#define FCEU_OVERLAY_MIRROR_NONE  0xFF
+
+static uint8 OverlaySourceRGB[256][3];
+static uint8 OverlaySourceValid = 0;
+static uint8 OverlayMirrorSlot[256];
+static uint8 OverlayMirrorNext = FCEU_OVERLAY_MIRROR_FIRST;
+/* VT32 $2010=$80 can use every one of the 256 indexed output colours.
+ * Track which indices the already-rendered game frame actually uses, then
+ * borrow only unused indices for OSD colours. */
+static uint8 OverlayPackedUsed[256];
+/* VT369 enhanced output is a 9-bit 0..511 index split between XBuf low6 and
+ * XDBuf high3. Values 64..255 can therefore be used as temporary OSD markers
+ * because genuine VT369 game pixels have already been reduced to XBuf 0..63. */
+/* Stage 2.4.2: VT369 direct pixels live in a separate XDBuf domain.  Snapshot
+ * the raw game framebuffer before emulator HUD/OSD drawing so Finalize can
+ * clear that direct-color sideband only on pixels actually changed by the OSD.
+ * This avoids the Stage 2.4.1 marker collision with ordinary FCEUX pixels
+ * (which legitimately occupy the whole $40-$FF range). */
+static uint8 OverlayVT369Before[256 * 256];
+static uint8 OverlayVT369BeforeValid = 0;
+/* Stage 2.4.5: VT369 HUD/OSD must not depend on XBuf palette indices at all.
+ * Some OneBus games rewrite the same $80-$FF entries FCEUX normally uses for
+ * its HUD, so merely clearing XDBuf's direct-color bit cannot restore the
+ * original HUD colours.  Record the exact pre-game FCEUX RGB for every OSD
+ * pixel and let the final blitter composite that RGB above the game. */
+static uint32 OverlayVT369RGB[256 * 256];
+static uint8 OverlayVT369Owned[256 * 256];
+/* Fast-forward R1: remember whether the previous frame used an extended OSD
+ * path.  Ordinary NES frames can then avoid clearing 64 KiB of VT369-only HUD
+ * ownership state every frame; a transition away from VT still clears once. */
+static uint8 OverlayPreviousMode = 0;
+
+/* Stage 2.4.7: overlay/direct-color ownership is frame-local state.  It must
+ * never survive ROM close/reset or virtual-video reinitialization; otherwise
+ * the final blitter can composite a previous VT369 HUD above the blank screen
+ * or the first frame of the next (even non-OneBus) game. */
+void FCEU_ResetOverlayFrameState(void)
+{
+	memset(OverlayVT369Owned, 0, sizeof(OverlayVT369Owned));
+	memset(OverlayVT369RGB, 0, sizeof(OverlayVT369RGB));
+	memset(OverlayVT369Before, 0, sizeof(OverlayVT369Before));
+	OverlayVT369BeforeValid = 0;
+	OverlayPreviousMode = 0;
+	memset(OverlayPackedUsed, 0, sizeof(OverlayPackedUsed));
+	memset(OverlayMirrorSlot, FCEU_OVERLAY_MIRROR_NONE, sizeof(OverlayMirrorSlot));
+	OverlayMirrorNext = FCEU_OVERLAY_MIRROR_FIRST;
+}
+
+int FCEU_OverlayUsesFixedPalette(void)
+{
+	/* Stage 2.4.6: the OSD is drawn after PPU rendering, often after the game
+	 * has already changed/cleared $201E in VBlank.  If this rendered frame ever
+	 * produced a VT369 direct RGB555 pixel, keep mode 3 latched for the whole
+	 * post-frame HUD pass instead of consulting only the live register state. */
+	if (FCEU_VT369FrameDirectColor) return 3;
+	return FFCEUX_PPUUseFixedOSD && FFCEUX_PPUUseFixedOSD();
+}
+
+/* Stage 2.4.4: overlay ownership must be recorded at WRITE time.  Comparing
+ * XBuf before/after the OSD is not sufficient because an overlay pixel can
+ * legitimately write the same 8-bit value that the game pixel already had;
+ * in that case the old VT369 RGB555 sideband would survive and hide/recolour
+ * the HUD.  Every emulator overlay write goes through this helper so the
+ * corresponding XDBuf entry is immediately returned to the ordinary FCEUX
+ * indexed-palette domain. */
+void FCEU_OverlayWritePixel(uint8 *dest, uint8 value)
+{
+	if (!dest) return;
+	*dest = value;
+	if (FCEU_OverlayUsesFixedPalette() == 3 && XBuf && XDBuf) {
+		const ptrdiff_t ofs = dest - XBuf;
+		if (ofs >= 0 && ofs < (ptrdiff_t)(256 * 256)) {
+			XDBuf[ofs] = 0;
+			uint8 r, g, b;
+			if (OverlaySourceValid) {
+				r = OverlaySourceRGB[value][0];
+				g = OverlaySourceRGB[value][1];
+				b = OverlaySourceRGB[value][2];
+			}
+			else {
+				FCEUD_GetPalette(value, &r, &g, &b);
+			}
+			OverlayVT369RGB[ofs] = ((uint32)r << 16) | ((uint32)g << 8) | b;
+			OverlayVT369Owned[ofs] = 1;
+		}
+	}
+}
+
+int FCEU_OverlayGetRGB(int offset, uint8 *r, uint8 *g, uint8 *b)
+{
+	/* Stage 2.4.8: RGB overlay ownership is valid only for the frame that
+	 * created it.  Never allow a stale ownership plane to composite above a
+	 * later non-VT369/direct-color frame. */
+	if (!FCEU_VT369FrameDirectColor) return 0;
+	if (offset < 0 || offset >= 256 * 256 || !OverlayVT369Owned[offset]) return 0;
+	const uint32 rgb = OverlayVT369RGB[offset];
+	if (r) *r = (uint8)(rgb >> 16);
+	if (g) *g = (uint8)(rgb >> 8);
+	if (b) *b = (uint8)rgb;
+	return 1;
+}
+
+void FCEU_CaptureOverlayPalette(void)
+{
+	for (int i = 0; i < 256; ++i)
+		FCEUD_GetPalette((uint8)i, &OverlaySourceRGB[i][0], &OverlaySourceRGB[i][1], &OverlaySourceRGB[i][2]);
+	OverlaySourceValid = 1;
+	memset(OverlayMirrorSlot, FCEU_OVERLAY_MIRROR_NONE, sizeof(OverlayMirrorSlot));
+	OverlayMirrorNext = FCEU_OVERLAY_MIRROR_FIRST;
+}
+
+void FCEU_BeginOverlayPaletteFrame(void)
+{
+	const int mode = FCEU_OverlayUsesFixedPalette();
+	/* Fast-forward R1: ordinary NES frames never use the VT369 RGB ownership
+	 * plane.  Clear it only while mode 3 is active, or once when leaving mode 3,
+	 * which preserves the Stage 2.4.8 anti-freeze guarantee without a 64 KiB
+	 * memset on every normal frame. */
+	if (mode == 3 || OverlayPreviousMode == 3)
+		memset(OverlayVT369Owned, 0, sizeof(OverlayVT369Owned));
+	OverlayVT369BeforeValid = 0;
+
+	/* Packed/extended OSD modes need a fresh source->slot map.  Ordinary mode 0
+	 * does not consult it at all, so avoid another per-frame clear there. */
+	if (mode) {
+		memset(OverlayMirrorSlot, FCEU_OVERLAY_MIRROR_NONE, sizeof(OverlayMirrorSlot));
+		OverlayMirrorNext = FCEU_OVERLAY_MIRROR_FIRST;
+	}
+	OverlayPreviousMode = (uint8)mode;
+
+	if (mode == 2 || mode == 3) {
+		/* Packed VT32 still borrows indexed palette slots and needs a refresh.
+		 * VT369 mode 3 does not: its game RGB is snapshotted per pixel and its
+		 * HUD has an independent RGB plane.  Refreshing from live VBlank state
+		 * can actually reapply the wrong post-raster palette to the completed frame. */
+		if (mode == 2 && FFCEUX_PPURefreshExtPalette)
+			FFCEUX_PPURefreshExtPalette();
+
+		int first = FSettings.FirstSLine;
+		int last = FSettings.LastSLine;
+		if (first < 0) first = 0;
+		if (last > 255) last = 255;
+		if (mode == 2) {
+			memset(OverlayPackedUsed, 0, sizeof(OverlayPackedUsed));
+			if (XBuf) {
+				for (int y = first; y <= last; ++y) {
+					const uint8 *line = XBuf + y * 256;
+					for (int x = 0; x < 256; ++x) OverlayPackedUsed[line[x]] = 1;
+				}
+			}
+		}
+		else {
+			/* No palette-slot borrowing is needed for VT369 anymore: genuine
+			 * game pixels use FCEU_DirectPalette512 only when XDBuf.bit7 is set,
+			 * while emulator HUD pixels can stay in the ordinary FCEUX palette.
+			 * Keep a full pre-overlay snapshot so Finalize can identify every
+			 * touched pixel, including shaded/outlined areas. */
+			if (XBuf) {
+				memcpy(OverlayVT369Before, XBuf, sizeof(OverlayVT369Before));
+				OverlayVT369BeforeValid = 1;
+			}
+		}
+	}
+}
+
+uint8 FCEU_ResolveOverlayColor(uint8 color)
+{
+	const int mode = FCEU_OverlayUsesFixedPalette();
+	if (!mode)
+		return color;
+
+	/* In ordinary VT03/VT09/VT32 COLCOMP the low GUI entries are outside
+	 * the game-owned $80-$FF range and are therefore intrinsically safe.
+	 * Packed VT32 owns all 256 indices, so even low colours must be remapped. */
+	if (mode == 1 && color < FCEU_OVERLAY_MIRROR_FIRST)
+		return color;
+
+	if (OverlayMirrorSlot[color] != FCEU_OVERLAY_MIRROR_NONE)
+		return OverlayMirrorSlot[color];
+
+	if (mode == 3) {
+		/* Stage 2.4.2: keep emulator HUD/OSD in the ordinary FCEUX palette.
+		 * Direct VT369 RGB555 ownership is carried independently in XDBuf.bit7,
+		 * so there is no reason to consume game 9-bit palette entries here. */
+		return color;
+	}
+
+	if (mode == 2) {
+		uint8 r, g, b;
+		if (OverlaySourceValid) {
+			r = OverlaySourceRGB[color][0];
+			g = OverlaySourceRGB[color][1];
+			b = OverlaySourceRGB[color][2];
+		}
+		else {
+			FCEUD_GetPalette(color, &r, &g, &b);
+		}
+
+		/* Prefer an index not used anywhere in the current game frame. Changing
+		 * its RGB cannot recolour any game pixel, while the OSD gets the exact
+		 * ordinary FCEUX colour. */
+		for (int i = 0; i < 256; ++i) {
+			if (!OverlayPackedUsed[i]) {
+				const uint8 slot = (uint8)i;
+				FCEUD_SetPalette(slot, r, g, b);
+				OverlayPackedUsed[i] = 1;
+				OverlayMirrorSlot[color] = slot;
+				return slot;
+			}
+		}
+
+		/* A pathological frame may use all 256 pens. Do not overwrite a game
+		 * colour in that case; choose the closest already-present RGB instead. */
+		unsigned bestDist = ~0U;
+		uint8 best = 0;
+		for (int i = 0; i < 256; ++i) {
+			uint8 pr, pg, pb;
+			FCEUD_GetPalette((uint8)i, &pr, &pg, &pb);
+			const int dr = (int)pr - r;
+			const int dg = (int)pg - g;
+			const int db = (int)pb - b;
+			const unsigned d = (unsigned)(dr * dr + dg * dg + db * db);
+			if (d < bestDist) { bestDist = d; best = (uint8)i; }
+		}
+		OverlayMirrorSlot[color] = best;
+		return best;
+	}
+
+	if (OverlayMirrorNext <= FCEU_OVERLAY_MIRROR_LAST) {
+		const uint8 slot = OverlayMirrorNext++;
+		uint8 r, g, b;
+		if (OverlaySourceValid) {
+			r = OverlaySourceRGB[color][0];
+			g = OverlaySourceRGB[color][1];
+			b = OverlaySourceRGB[color][2];
+		}
+		else {
+			/* Startup fallback: normally the snapshot is captured by WritePalette
+			 * before a game can enable COLCOMP. */
+			FCEUD_GetPalette(color, &r, &g, &b);
+		}
+		FCEUD_SetPalette(slot, r, g, b);
+		OverlayMirrorSlot[color] = slot;
+		return slot;
+	}
+
+	/* More than 41 distinct OSD colours in one frame is not expected here. */
+	return 1;
+}
+
+void FCEU_FinalizeOverlayPaletteFrame(void)
+{
+	if (FCEU_OverlayUsesFixedPalette() != 3 || !XBuf || !XDBuf || !OverlayVT369BeforeValid) return;
+	int first = FSettings.FirstSLine;
+	int last = FSettings.LastSLine;
+	if (first < 0) first = 0;
+	if (last > 255) last = 255;
+	for (int y = first; y <= last; ++y) {
+		uint8 *line = XBuf + y * 256;
+		uint8 *dline = XDBuf + y * 256;
+		const uint8 *before = OverlayVT369Before + y * 256;
+		for (int x = 0; x < 256; ++x) {
+			if (line[x] != before[x]) {
+				/* Emulator overlays are ordinary indexed FCEUX pixels.  Remove any
+				 * VT369 direct-color tag inherited from the game pixel underneath;
+				 * also clear stale emphasis/high-index bits. */
+				dline[x] = 0;
+			}
+		}
+	}
 }
 
 static int FixJoedChar(uint8 ch)
@@ -406,6 +692,8 @@ char target[64][256];
 
 void DrawTextTransWH(uint8* dest, int width, uint8* textmsg, uint8 fgcolor, int max_w, int max_h, int border)
 {
+	const int fixedOverlayPalette = FCEU_OverlayUsesFixedPalette();
+	if (fixedOverlayPalette) fgcolor = FCEU_ResolveOverlayColor(fgcolor);
 	int beginx = 2, x = beginx;
 	int y = 2;
 
@@ -506,17 +794,15 @@ textoverflow:
 			}
 
 			if (pixel_color >= 200)
-				dest[offs] = fgcolor;
+				FCEU_OverlayWritePixel(&dest[offs], fgcolor);
 			else if (pixel_color >= 10)
 			{
-				if (dest[offs] < 0xA0)
-					dest[offs] = 0xC1;
-				else
-					dest[offs] = 0xD1;
+				const uint8 outline = (dest[offs] < 0xA0) ? 0xC1 : 0xD1;
+				FCEU_OverlayWritePixel(&dest[offs], fixedOverlayPalette ? FCEU_ResolveOverlayColor(outline) : outline);
 			}
 			else if (pixel_color > 0)
 			{
-				dest[offs] = 0xCF;
+				FCEU_OverlayWritePixel(&dest[offs], fixedOverlayPalette ? FCEU_ResolveOverlayColor(0xCF) : 0xCF);
 			}
 		}
 	}

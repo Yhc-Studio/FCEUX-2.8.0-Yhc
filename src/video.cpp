@@ -65,6 +65,7 @@
 u8* XBuf = NULL; //used for current display
 u8* XBackBuf = NULL; //ppu output is stashed here before drawing happens
 u8* XDBuf = NULL; //corresponding to XBuf but with deemph bits
+uint8 FCEU_VT369FrameDirectColor = 0;
 u8* XDBackBuf = NULL; //corresponding to XBackBuf but with deemph bits
 int ClipSidesOffset = 0;	//Used to move displayed messages when Clips left and right sides is checked
 static u8* xbsave = NULL;
@@ -89,8 +90,25 @@ std::string FCEUI_GetSnapshotAsName() { return AsSnapshotName; }
 
 static void FCEU_DrawPauseCountDown(uint8* XBuf);
 
+/* Stage 2.4.7: clear every transient video-domain state introduced by the
+ * VT369 direct RGB555/HUD path.  FCEU_CloseGame historically cleared only
+ * XBuf, which left XDBuf direct tags and the RGB overlay ownership plane alive
+ * across ROM changes.  The next blit could therefore resurrect old pixels/HUD. */
+void FCEU_ResetVideoFrameState(int clearFrameBuffers)
+{
+	FCEU_VT369FrameDirectColor = 0;
+	FCEU_ResetOverlayFrameState();
+	if (XDBuf) memset(XDBuf, 0, 256 * 256);
+	if (XDBackBuf) memset(XDBackBuf, 0, 256 * 256);
+	if (clearFrameBuffers) {
+		if (XBuf) memset(XBuf, 0, 256 * 256);
+		if (XBackBuf) memset(XBackBuf, 0, 256 * 256);
+	}
+}
+
 void FCEU_KillVirtualVideo(void)
 {
+	FCEU_ResetVideoFrameState(0);
 	if (XBuf)
 	{
 		FCEU_afree(XBuf); XBuf = NULL;
@@ -134,6 +152,7 @@ int FCEU_InitVirtualVideo(void)
 	memset(XBackBuf, 128, 256 * 256);
 	memset(XDBuf, 0, 256 * 256);
 	memset(XDBackBuf, 0, 256 * 256);
+	FCEU_ResetVideoFrameState(0);
 
 	return 1;
 }
@@ -194,11 +213,12 @@ static uint32 GetButtonColor(uint32 held, uint32 c, uint32 ci, int bit)
 		else
 			color = (ci & mask) ? oni : off;
 	}
-	return color;
+	return FCEU_ResolveOverlayColor((uint8)color);
 }
 
 void FCEU_PutImage(void)
 {
+	FCEU_BeginOverlayPaletteFrame();
 	if (dosnapsave == 2)	//Save screenshot as, currently only flagged & run by the Win32 build. //TODO SDL: implement this?
 	{
 		char nameo[512];
@@ -221,6 +241,7 @@ void FCEU_PutImage(void)
 		//Save snapshot after NSF screen is drawn.  Why would we want to do it before?
 		if (dosnapsave == 1)
 		{
+			FCEU_FinalizeOverlayPaletteFrame();
 			ReallySnap();
 			dosnapsave = 0;
 		}
@@ -242,11 +263,12 @@ void FCEU_PutImage(void)
 		//Save snapshot
 		if (dosnapsave == 1)
 		{
+			FCEU_FinalizeOverlayPaletteFrame();
 			ReallySnap();
 			dosnapsave = 0;
 		}
 
-		if (!FCEUI_AviEnableHUDrecording()) snapAVI();
+		if (!FCEUI_AviEnableHUDrecording()) { FCEU_FinalizeOverlayPaletteFrame(); snapAVI(); }
 
 		if (GameInfo->type == GIT_VSUNI)
 			FCEU_VSUniDraw(XBuf);
@@ -271,12 +293,15 @@ void FCEU_PutImage(void)
 		if (input_display > 4) input_display = 4;
 		for (int controller = 0; controller < input_display; controller++, t += 56)
 		{
+			const int fixedOverlayPalette = FCEU_OverlayUsesFixedPalette();
 			for (i = 0; i < 34; i++)
-				for (j = 0; j < 9; j++)
-					t[i + j * 256] = (t[i + j * 256] & 0x30) | 0xC1;
+				for (j = 0; j < 9; j++) {
+					const uint8 shade = (uint8)((t[i + j * 256] & 0x30) | 0xC1);
+					FCEU_OverlayWritePixel(&t[i + j * 256], fixedOverlayPalette ? FCEU_ResolveOverlayColor(shade) : shade);
+				}
 			for (i = 3; i < 6; i++)
 				for (j = 3; j < 6; j++)
-					t[i + j * 256] = 0xCF;
+					FCEU_OverlayWritePixel(&t[i + j * 256], fixedOverlayPalette ? FCEU_ResolveOverlayColor(0xCF) : 0xCF);
 
 			uint32 held = 0;
 			uint32 c = cur_input_display >> (controller * 8);
@@ -305,7 +330,7 @@ void FCEU_PutImage(void)
 				{
 					if (i % 3 == 0 && j % 3 == 0)
 						continue;
-					t[30 + 4 * 256 + i + j * 256] = color;
+					FCEU_OverlayWritePixel(&t[30 + 4 * 256 + i + j * 256], color);
 				}
 			}
 			//B
@@ -316,22 +341,22 @@ void FCEU_PutImage(void)
 				{
 					if (i % 3 == 0 && j % 3 == 0)
 						continue;
-					t[24 + 4 * 256 + i + j * 256] = color;
+					FCEU_OverlayWritePixel(&t[24 + 4 * 256 + i + j * 256], color);
 				}
 			}
 			//Select
 			color = GetButtonColor(held, c, ci, 2);
 			for (i = 0; i < 4; i++)
 			{
-				t[11 + 5 * 256 + i] = color;
-				t[11 + 6 * 256 + i] = color;
+				FCEU_OverlayWritePixel(&t[11 + 5 * 256 + i], color);
+				FCEU_OverlayWritePixel(&t[11 + 6 * 256 + i], color);
 			}
 			//Start
 			color = GetButtonColor(held, c, ci, 3);
 			for (i = 0; i < 4; i++)
 			{
-				t[17 + 5 * 256 + i] = color;
-				t[17 + 6 * 256 + i] = color;
+				FCEU_OverlayWritePixel(&t[17 + 5 * 256 + i], color);
+				FCEU_OverlayWritePixel(&t[17 + 6 * 256 + i], color);
 			}
 			//Up
 			color = GetButtonColor(held, c, ci, 4);
@@ -339,7 +364,7 @@ void FCEU_PutImage(void)
 			{
 				for (j = 0; j < 3; j++)
 				{
-					t[3 + i + 256 * j] = color;
+					FCEU_OverlayWritePixel(&t[3 + i + 256 * j], color);
 				}
 			}
 			//Down
@@ -348,7 +373,7 @@ void FCEU_PutImage(void)
 			{
 				for (j = 0; j < 3; j++)
 				{
-					t[3 + i + 256 * j + 6 * 256] = color;
+					FCEU_OverlayWritePixel(&t[3 + i + 256 * j + 6 * 256], color);
 				}
 			}
 			//Left
@@ -357,7 +382,7 @@ void FCEU_PutImage(void)
 			{
 				for (j = 0; j < 3; j++)
 				{
-					t[3 * 256 + i + 256 * j] = color;
+					FCEU_OverlayWritePixel(&t[3 * 256 + i + 256 * j], color);
 				}
 			}
 			//Right
@@ -366,7 +391,7 @@ void FCEU_PutImage(void)
 			{
 				for (j = 0; j < 3; j++)
 				{
-					t[6 + 3 * 256 + i + 256 * j] = color;
+					FCEU_OverlayWritePixel(&t[6 + 3 * 256 + i + 256 * j], color);
 				}
 			}
 		}
@@ -376,12 +401,14 @@ void FCEU_PutImage(void)
 	{
 		if (FCEUI_AviDisableMovieMessages())
 		{
+			FCEU_FinalizeOverlayPaletteFrame();
 			snapAVI();
 			DrawMessage(false);
 		}
 		else
 		{
 			DrawMessage(false);
+			FCEU_FinalizeOverlayPaletteFrame();
 			snapAVI();
 		}
 	}
@@ -393,12 +420,17 @@ void FCEU_PutImage(void)
 		 * gets audio only unless HUD recording is enabled.  Record the already-drawn
 		 * NSF player screen here while keeping the old non-HUD behavior for carts.
 		 */
-		if (GameInfo && GameInfo->type == GIT_NSF)
+		if (GameInfo && GameInfo->type == GIT_NSF) {
+			FCEU_FinalizeOverlayPaletteFrame();
 			snapAVI();
+		}
 
 		DrawMessage(false);
 	}
 
+	/* Convert any VT369 OSD marker pixels added after the last capture into
+	 * the real 9-bit XBuf/XDBuf direct-palette index before the driver blits. */
+	FCEU_FinalizeOverlayPaletteFrame();
 }
 void snapAVI()
 {

@@ -54,6 +54,30 @@ void X6502_RunAuto(int32 cycles);
 
 extern uint32 timestamp;
 extern uint32 soundtimestamp;
+
+extern uint8 encryptOpcodes;
+extern uint8 encryptOpcodesConfig;
+extern uint8 encryptOpcodesPending;
+extern uint8 encryptOpcodesPendingMode;
+
+// Debugger/disassembler opcode decryption is gated separately from the CPU
+// fetch state. Only OneBus/VTxx boards may enable this guard; ordinary NES
+// boards always see raw opcode bytes even if a stale encryption variable were
+// ever to survive a frontend/load edge case.
+void X6502_SetOpcodeDebugDecryptionEnabled(uint8 enabled);
+uint8 X6502_IsOpcodeDebugDecryptionEnabled(void);
+
+// Return the opcode byte as the CPU will execute it under the currently
+// active OneBus/VTxx opcode-encryption mode. This helper is side-effect free
+// and returns rawOpcode unchanged while the board guard is disabled.
+uint8 X6502_DecodeOpcodeForDebug(uint8 rawOpcode);
+
+// VT369 can run the main 6502 at 3x while PPU/APU remain at their base
+// clocks. The multiplier is board-controlled ($411C.7) and defaults to 1.
+void X6502_SetOneBusClockMultiplier(uint8 multiplier);
+uint8 X6502_GetOneBusClockMultiplier(void);
+// PPU timing units: 48 units per ordinary CPU cycle, 16 per VT369 3x cycle.
+uint32 X6502_GetPPUTimestamp48(void);
 extern int scanline;
 
 #define N_FLAG  0x80
@@ -89,6 +113,7 @@ void TriggerNMI2(void);
 
 uint8 X6502_DMR(uint32 A);
 void X6502_DMW(uint32 A, uint8 V);
+void X6502_AddCycles(int cycles);
 
 void X6502_IRQBegin(int w);
 void X6502_IRQEnd(int w);

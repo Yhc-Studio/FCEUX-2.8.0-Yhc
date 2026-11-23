@@ -221,10 +221,9 @@ static void FCEU_CloseGame(void)
 
 		ResetExState(0, 0);
 
-		//clear screen when game is closed
-		extern uint8* XBuf;
-		if (XBuf)
-			memset(XBuf, 0, 256 * 256);
+		// Stage 2.4.7: clear both the ordinary framebuffer and all VT369
+		// direct-color/HUD side state so nothing can leak into the next ROM.
+		FCEU_ResetVideoFrameState(1);
 
 		FCEU_CloseGenie();
 
@@ -401,6 +400,15 @@ static DECLFR(ARAMH) {
 
 void ResetGameLoaded(void) {
 	if (GameInfo) FCEU_CloseGame();
+
+	// OneBus opcode decryption is a CPU-global fetch mode. Clear it when
+	// changing game types so it cannot affect NSF/FDS/other non-OneBus loads.
+	encryptOpcodes = 0;
+	encryptOpcodesConfig = 0;
+	encryptOpcodesPending = 0;
+	encryptOpcodesPendingMode = 0;
+	X6502_SetOpcodeDebugDecryptionEnabled(0);
+
 	EmulationPaused = 0; //mbg 5/8/08 - loading games while paused was bad news. maybe this fixes it
 	GameStateRestore = 0;
 	PPU_hook = NULL;
@@ -927,6 +935,7 @@ void ResetNES(void) {
 	FCEUMOV_AddCommand(FCEUNPCMD_RESET);
 	if (!GameInfo) return;
 	GameInterface(GI_RESETM2);
+	FCEU_ResetVideoFrameState(1);
 	FCEUSND_Reset();
 	FCEUPPU_Reset();
 	X6502_Reset();
@@ -1023,6 +1032,14 @@ void hand(X6502* X, int type, uint32 A) {
 void PowerNES(void) {
 	FCEUMOV_AddCommand(FCEUNPCMD_POWER);
 	if (!GameInfo) return;
+
+	encryptOpcodes = 0;
+	encryptOpcodesConfig = 0;
+	encryptOpcodesPending = 0;
+	encryptOpcodesPendingMode = 0;
+	// Every power cycle starts in the safe ordinary-NES debugger state.
+	// OneBus/VTxx board Power() explicitly re-enables debugger decryption.
+	X6502_SetOpcodeDebugDecryptionEnabled(0);
 
 	//reseed random, unless we're in a movie
 	extern int disableBatteryLoading;

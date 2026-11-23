@@ -51,6 +51,7 @@ struct CartInfo
 	int PRGRamSaveSize;	/* prg ram size in bytes (non-volatile or battery backed) */
 	int CHRRamSaveSize;	/* chr ram size in bytes (non-volatile or battery backed) */
 	int submapper;	// Submappers as defined by NES 2.0
+	int extendedConsoleType; // NES 2.0 byte 13 low 6 bits when console type == 3
 	int wram_size;
 	int battery_wram_size;
 	int vram_size;
@@ -83,6 +84,7 @@ struct CartInfo
 		battery = 0;
 		ines2 = 0;
 		submapper = 0;
+		extendedConsoleType = 0;
 		wram_size = 0;
 		battery_wram_size = 0;
 		vram_size = 0;

@@ -24,12 +24,17 @@
 void VRC7_syncWRAM (int);
 void VRC7_syncPRG (int, int);
 void VRC7_syncCHR (int, int);
+int VRC7_getCHRBank(uint8);
 void VRC7_syncMirror ();
 DECLFR(VRC7_readWRAM);
-DECLFW(MMC3_writeWRAM);
+DECLFW(VRC7_writeWRAM);
 DECLFW(VRC7_writeReg);
 void VRC7_cpuCycle (int);
 void VRC7_clear ();
+void VRC7_setFMEnabled(uint8); // 0 for non-FM VRC7 clones, 1 for VRC7a
+void VRC7_setPirateMode(uint8); // optional YOKO VRC7P IRQ threshold 248
+void VRC7_deactivate(void);
+void VRC7_close(void);
 void VRC7_activate (uint8, void (*)(), int);
 void VRC7_addExState ();
 void VRC7_restore (int);

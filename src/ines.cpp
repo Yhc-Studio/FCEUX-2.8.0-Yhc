@@ -235,6 +235,25 @@ static void FreeLargeROMBuffer(uint8*& ptr, bool& usesVirtualAlloc)
 	usesVirtualAlloc = false;
 }
 
+// NES 2.0 records the logical ROM length, while the legacy cart mapper uses
+// power-of-two backing buffers so its bank masks remain valid.  Keep those
+// two sizes separate: read/hash only the logical bytes and leave the mapped
+// tail filled with 0xFF.
+static bool RoundROMBufferSize(uint64 logicalSize, uint32* mappedSize)
+{
+	if (!mappedSize || logicalSize > 0x7FFFFFFFULL)
+		return false;
+	if (!logicalSize) {
+		*mappedSize = 0;
+		return true;
+	}
+	const uint32 rounded = uppow2((uint32)logicalSize);
+	if (!rounded || (uint64)rounded < logicalSize)
+		return false;
+	*mappedSize = rounded;
+	return true;
+}
+
 static DECLFR(TrainerRead) {
 	return(trainerpoo[A & 0x1FF]);
 }
@@ -577,8 +596,9 @@ static void CheckHInfo(uint64 partialmd5) {
 	do {
 		if (moo[x].crc32 == iNESGameCRC32) {
 			if (moo[x].mapper >= 0) {
-				if (moo[x].mapper & 0x800 && VROM_size) {
+				if (moo[x].mapper & 0x800 && iNESCart.CHRRomSize > 0) {
 					VROM_size = 0;
+					iNESCart.CHRRomSize = 0;
 					FreeLargeROMBuffer(VROM, VROMUsesVirtualAlloc);
 					tofix |= 8;
 				}
@@ -949,6 +969,7 @@ BMAPPINGLocal bmap[] = {
 	{ "8-in-1 JY-119",  267, Mapper267_Init },
 	{ "AA6023/AA6023B",		268, AA6023_Init },
 	{ "Games Xplosion 121-in-1", 269, Mapper269_Init },
+	{ "VT42xx", 270, Mapper270_Init },
 	{ "MGC-026", 271, Mapper271_Init },
 	{ "J-3?-C", 273, Mapper273_Init },
 	{ "80013-B", 274, BMC80013B_Init },
@@ -968,6 +989,7 @@ BMAPPINGLocal bmap[] = {
 	{ "NewStar 12-in-1/7-in-1", 293, Mapper293_Init },
 	{ "63-1601 ",	294, Mapper294_Init },
 	{ "晶太 YY860216C",	295, Mapper295_Init },
+	{ "VT3x / Mapper296",	296, Mapper296_Init },
 	{ "TXC 01-22110-000",    297, Mapper297_Init },
 	{ "TF1201", 298, UNLTF1201_Init },
 	{ "11160", 299, BMC11160_Init },
@@ -1071,6 +1093,7 @@ BMAPPINGLocal bmap[] = {
 	{ "89433", 403, Mapper403_Init },
 	{ "晶太 JY012005",      404, Mapper404_Init },
 	{ "Impact Soft",	406, Mapper406_Init },
+	{ "VT4FFx", 408, Mapper408_Init },
 	{ "retroUSB DPCMcart", 409, Mapper409_Init },
 	{ "JY-302",  410, Mapper410_Init },
 	{ "A88S-1",	411, Mapper411_Init },
@@ -1084,6 +1107,7 @@ BMAPPINGLocal bmap[] = {
 	{ "A971210",	420, Mapper420_Init },
 	{ "晶太 SC871115C",	421, Mapper421_Init },
 	{ "BS-400R/BS-4040",	422, Mapper422_Init },
+	{ "Cube Tech VT369",	425, Mapper425_Init },
 	{ "BB-002A/TF2740",	428, Mapper428_Init },
 	{ "LIKO BBG-235-8-1B",	429, Mapper429_Init },
 	{ "831031C/T-308",	430, Mapper430_Init },
@@ -1151,8 +1175,6 @@ BMAPPINGLocal bmap[] = {
 	{ "K-3011",  498, Mapper498_Init },
 	{ "FC-41", 499, Mapper499_Init },
 	{ "Yhc Unrom",	500, Mapper500_Init },
-	{ "Yhc Axrom",	501, Mapper501_Init },
-	{ "Yhc A/B/Uxrom",	502, Mapper502_Init },
 	{ "ET-170", 503, Mapper503_Init },
 	{ "K-3054", 504, Mapper504_Init },
 	{ "5426757A-Y2-230630", 505, Mapper505_Init },
@@ -1360,48 +1382,70 @@ int iNESLoad(const char* name, FCEUFILE* fp, int OverwriteVidMode) {
 	MirroringAs2bits = head.ROM_type & 1;
 	if (head.ROM_type & 8) MirroringAs2bits |= 2;
 
-	int not_round_size = 0;
-	int rom_size_bytes = 0;
-	int vrom_size_bytes = 0;
+	uint64 not_round_size = 0;
+	uint64 not_round_vrom_size = 0;
+	uint64 displayedPrgSize = 0;
+	uint32 rom_size_bytes = 0;
+	uint32 vrom_size_bytes = 0;
 
 	if (!iNES2) {
-		not_round_size = head.ROM_size << 14;
+		not_round_size = (uint64)head.ROM_size << 14;
+		not_round_vrom_size = (uint64)head.VROM_size << 13;
+		// Preserve the legacy iNES convention used by this FCEUX branch.
+		if (!head.ROM_size)
+			not_round_size = 256ULL << 14;
 	}
 	else {
-		if ((head.Upper_ROM_VROM_size & 0x0F) != 0x0F)
-			// simple notation
-			not_round_size = (head.ROM_size | ((head.Upper_ROM_VROM_size & 0x0F) << 8)) << 14;
-		else
-			// exponent-multiplier notation
-			not_round_size = ((1 << (head.ROM_size >> 2)) * ((head.ROM_size & 0b11) * 2 + 1));
+		if ((head.Upper_ROM_VROM_size & 0x0F) != 0x0F) {
+			// PRG simple notation: 16 KiB units.
+			not_round_size = (uint64)(head.ROM_size | ((head.Upper_ROM_VROM_size & 0x0F) << 8)) << 14;
+		}
+		else {
+			// PRG exponent-multiplier notation: bytes = 2^E * (2*M + 1).
+			const uint32 exponent = head.ROM_size >> 2;
+			const uint32 multiplier = ((head.ROM_size & 0x03) << 1) + 1;
+			if (exponent >= 31) {
+				FCEU_PrintError(" NES 2.0 PRG-ROM size exceeds the supported addressable range.\n");
+				return LOADER_INVALID_FORMAT;
+			}
+			not_round_size = ((uint64)1 << exponent) * multiplier;
+		}
+
+		if ((head.Upper_ROM_VROM_size & 0xF0) != 0xF0) {
+			// CHR simple notation: 8 KiB units.
+			not_round_vrom_size = (uint64)(head.VROM_size | ((head.Upper_ROM_VROM_size & 0xF0) << 4)) << 13;
+		}
+		else {
+			// CHR exponent-multiplier notation: bytes = 2^E * (2*M + 1).
+			const uint32 exponent = head.VROM_size >> 2;
+			const uint32 multiplier = ((head.VROM_size & 0x03) << 1) + 1;
+			if (exponent >= 31) {
+				FCEU_PrintError(" NES 2.0 CHR-ROM size exceeds the supported addressable range.\n");
+				return LOADER_INVALID_FORMAT;
+			}
+			not_round_vrom_size = ((uint64)1 << exponent) * multiplier;
+		}
 	}
 
-	if (!head.ROM_size && !iNES2)
-		rom_size_bytes = 256 << 14;
-	else
-		rom_size_bytes = uppow2(not_round_size);
+	// CartInfo stores logical sizes in signed int fields. The backing buffers
+	// may be rounded up for bank-mask mapping, but the logical sizes must fit.
+	if ((iNES2 && !not_round_size) ||
+		not_round_size > 0x7FFFFFFFULL || not_round_vrom_size > 0x7FFFFFFFULL ||
+		!RoundROMBufferSize(not_round_size, &rom_size_bytes) ||
+		!RoundROMBufferSize(not_round_vrom_size, &vrom_size_bytes)) {
+		FCEU_PrintError(" ROM size cannot be represented by the current cartridge mapper.\n");
+		return LOADER_INVALID_FORMAT;
+	}
 
+	int round = !iNES2;
 	if (!iNES2) {
-		vrom_size_bytes = uppow2(head.VROM_size << 13);
-	}
-	else {
-		if ((head.Upper_ROM_VROM_size & 0xF0) != 0xF0)
-			// simple notation
-			vrom_size_bytes = uppow2((head.VROM_size | ((head.Upper_ROM_VROM_size & 0xF0) << 4)) << 13);
-		else
-			vrom_size_bytes = ((1 << (head.VROM_size >> 2)) * ((head.VROM_size & 0b11) * 2 + 1));
-	}
-
-	int round = true;
-	for (int i = 0; i != sizeof(not_power2) / sizeof(not_power2[0]); ++i) {
-		//for games not to the power of 2, so we just read enough
-		//prg rom from it, but we have to keep ROM_size to the power of 2
-		//since PRGCartMapping wants ROM_size to be to the power of 2
-		//so instead if not to power of 2, we just use head.ROM_size when
-		//we use FCEU_read
-		if (not_power2[i] == MapperNo) {
-			round = false;
-			break;
+		for (int i = 0; i != sizeof(not_power2) / sizeof(not_power2[0]); ++i) {
+			// Preserve the legacy iNES mapper-specific read behavior. NES 2.0
+			// always reads the exact logical PRG size, like the NRS loader.
+			if (not_power2[i] == MapperNo) {
+				round = false;
+				break;
+			}
 		}
 	}
 	ROM_size = rom_size_bytes >> 14;
@@ -1417,26 +1461,51 @@ int iNESLoad(const char* name, FCEUFILE* fp, int OverwriteVidMode) {
 		VROM = AllocateLargeROMBuffer((size_t)vrom_size_bytes, VROMUsesVirtualAlloc);
 	}
 
-	// Compute the logical PRG/CHR hash ranges before loading so the ultra-large
-	// streaming path can calculate all hashes while the file is being read.
-	iNESCart.PRGRomSize = ROM_size >= 0xF00 ? (pow(2, head.ROM_size >> 2) * ((head.ROM_size & 3) * 2 + 1)) : (ROM_size * 0x4000);
-	iNESCart.CHRRomSize = VROM_size >= 0xF00 ? (pow(2, head.VROM_size >> 2) * ((head.VROM_size & 3) * 2 + 1)) : (VROM_size * 0x2000);
+	// Keep the logical ROM lengths separate from the power-of-two backing
+	// allocations. For iNES 1.0, retain the legacy mapped-size metadata; for
+	// NES 2.0, expose the exact byte lengths declared by the header.
+	if (iNES2) {
+		iNESCart.PRGRomSize = (int)not_round_size;
+		iNESCart.CHRRomSize = (int)not_round_vrom_size;
+	}
+	else {
+		iNESCart.PRGRomSize = (int)(ROM_size * 0x4000);
+		iNESCart.CHRRomSize = (int)(VROM_size * 0x2000);
+	}
 
-	// Set Vs. System flag if need
+	// Set Vs. System / Extended Console Type flag if needed
 	if (!iNES2) {
 		GameInfo->type = !(head.ROM_type2 & 1) ? GIT_CART : GIT_VSUNI;
 	}
 	else {
-		switch (!(head.ROM_type2 & 2) ? (head.ROM_type2 & 3) : (head.VS_hardware & 0xF)) {
-		case 0:
+		uint8 consoleType = head.ROM_type2 & 0x03;
+		uint8 extendedType = head.VS_hardware & 0x3F;
+		iNESCart.extendedConsoleType = (consoleType == 3) ? extendedType : 0;
+
+		if (consoleType == 3 &&
+			extendedType >= 4 &&
+			extendedType <= 10) {
+
+			// V.R. Technology VT01 / VT02 / VT03 / VT09 / VT32 / VT369
+			// These systems are handled as cartridge hardware by the mapper.
 			GameInfo->type = GIT_CART;
-			break;
-		case 1:
-			GameInfo->type = GIT_VSUNI;
-			break;
-		default:
-			FCEU_PrintError("Game type is not supported at all.");
-			goto init_error;
+		}
+		else {
+			switch (!(head.ROM_type2 & 2) ?
+				consoleType : (head.VS_hardware & 0x0F)) {
+
+			case 0:
+				GameInfo->type = GIT_CART;
+				break;
+
+			case 1:
+				GameInfo->type = GIT_VSUNI;
+				break;
+
+			default:
+				FCEU_PrintError("Game type is not supported at all.");
+				goto init_error;
+			}
 		}
 	}
 
@@ -1551,15 +1620,18 @@ int iNESLoad(const char* name, FCEUFILE* fp, int OverwriteVidMode) {
 				}
 				job = hashJobs[md5JobIndex++];
 			}
+			const uint32 md5Length = iNES2 ? job.logicalLength : job.length;
+			if (!md5Length)
+				continue;
 #ifdef _WIN32
 			if (cngMd5Active) {
-				if (!cngMd5.update(job.data, job.length))
+				if (!cngMd5.update(job.data, md5Length))
 					cngMd5Failed = true;
 			}
 			else
 #endif
 			{
-				md5_update(&md5, job.data, job.length);
+				md5_update(&md5, job.data, md5Length);
 			}
 		}
 	};
@@ -1675,20 +1747,37 @@ int iNESLoad(const char* name, FCEUFILE* fp, int OverwriteVidMode) {
 		return offset;
 	};
 
-	const uint64 prgReadTarget = (uint64)((round) ? rom_size_bytes : not_round_size);
+	const uint64 prgReadTarget = iNES2 ? not_round_size : (round ? (uint64)rom_size_bytes : not_round_size);
 	readAndQueueRegion(ROM, (uint64)rom_size_bytes, prgReadTarget, (uint64)iNESCart.PRGRomSize, 0);
 
+	const uint64 chrReadTarget = iNES2 ? not_round_vrom_size : (uint64)vrom_size_bytes;
 	if (vrom_size_bytes)
-		readAndQueueRegion(VROM, (uint64)vrom_size_bytes, (uint64)vrom_size_bytes, (uint64)iNESCart.CHRRomSize, 1);
+		readAndQueueRegion(VROM, (uint64)vrom_size_bytes, chrReadTarget, (uint64)iNESCart.CHRRomSize, 1);
 
-	// Misc ROMS
-	if ((head.misc_roms & 0x03) && !(head.ROM_type & 4)) {
-		MiscROM_size = filesize - rom_size_bytes - vrom_size_bytes;
+	// NES 2.0 miscellaneous ROM follows the logical PRG and CHR payloads.
+	// Do not subtract padded mapper-buffer sizes: that would either swallow
+	// CHR/Misc data into PRG or calculate a negative MiscROM length for
+	// non-power-of-two ROMs. Trainer bytes have already been consumed above.
+	MiscROM_size = 0;
+	if (iNES2 && (head.misc_roms & 0x03)) {
+		const uint64 declaredRomBytes = not_round_size + not_round_vrom_size;
+		const uint64 payloadBytes = (uint64)filesize;
+		if (payloadBytes > declaredRomBytes) {
+			const uint64 miscBytes = payloadBytes - declaredRomBytes;
+			if (miscBytes <= 0x08000000ULL)
+				MiscROM_size = (uint32)miscBytes;
+			else
+				FCEU_PrintError(" Misc ROM exceeds the supported 128 MiB limit; ignoring it.\n");
+		}
+	}
+	if (MiscROM_size) {
 		MiscROM = AllocateLargeROMBuffer((size_t)MiscROM_size, MiscROMUsesVirtualAlloc);
-		const uint64 miscBytesRead = FCEU_fread(MiscROM, 1, MiscROM_size, fp);
-		if (miscBytesRead < (uint64)MiscROM_size)
-			memset(MiscROM + (size_t)miscBytesRead, 0xFF, (size_t)((uint64)MiscROM_size - miscBytesRead));
-		FCEU_printf(" Misc ROM size : %d\n", MiscROM_size);
+		if (MiscROM) {
+			const uint64 miscBytesRead = FCEU_fread(MiscROM, 1, MiscROM_size, fp);
+			if (miscBytesRead < (uint64)MiscROM_size)
+				memset(MiscROM + (size_t)miscBytesRead, 0xFF, (size_t)((uint64)MiscROM_size - miscBytesRead));
+			FCEU_printf(" Misc ROM size : %d\n", MiscROM_size);
+		}
 	}
 
 	uint32 prgCRC32 = 0;
@@ -1714,9 +1803,9 @@ int iNESLoad(const char* name, FCEUFILE* fp, int OverwriteVidMode) {
 			// Rare fallback only if CNG was unavailable/failed.  Preserve the exact
 			// legacy digest rather than risking a partially calculated result.
 			md5_starts(&md5);
-			md5_update(&md5, ROM, rom_size_bytes);
+			md5_update(&md5, ROM, iNES2 ? (uint32)iNESCart.PRGRomSize : rom_size_bytes);
 			if (vrom_size_bytes)
-				md5_update(&md5, VROM, vrom_size_bytes);
+				md5_update(&md5, VROM, iNES2 ? (uint32)iNESCart.CHRRomSize : vrom_size_bytes);
 			md5_finish(&md5, iNESCart.MD5);
 		}
 
@@ -1740,9 +1829,14 @@ int iNESLoad(const char* name, FCEUFILE* fp, int OverwriteVidMode) {
 
 		prgCRC32 = prgLogicalMatchesMapped ? mappedPrgCRC32 : logicalPrgCRC32;
 		chrCRC32 = chrLogicalMatchesMapped ? mappedChrCRC32 : logicalChrCRC32;
-		combinedCRC32 = vrom_size_bytes
-			? CalcCRC32Combine(mappedPrgCRC32, mappedChrCRC32, (uint64)vrom_size_bytes)
-			: mappedPrgCRC32;
+		if (iNES2)
+			combinedCRC32 = iNESCart.CHRRomSize
+				? CalcCRC32Combine(prgCRC32, chrCRC32, (uint64)iNESCart.CHRRomSize)
+				: prgCRC32;
+		else
+			combinedCRC32 = vrom_size_bytes
+				? CalcCRC32Combine(mappedPrgCRC32, mappedChrCRC32, (uint64)vrom_size_bytes)
+				: mappedPrgCRC32;
 	}
 	else {
 		// v1 path for small/medium images and machines with fewer than three
@@ -1751,7 +1845,12 @@ int iNESLoad(const char* name, FCEUFILE* fp, int OverwriteVidMode) {
 			prgCRC32 = CalcCRC32(0, ROM, iNESCart.PRGRomSize);
 			chrCRC32 = (VROM && iNESCart.CHRRomSize) ? CalcCRC32(0, VROM, iNESCart.CHRRomSize) : 0;
 
-			if (iNESCart.PRGRomSize == (uint32)rom_size_bytes &&
+			if (iNES2) {
+				combinedCRC32 = iNESCart.CHRRomSize
+					? CalcCRC32Combine(prgCRC32, chrCRC32, (uint64)iNESCart.CHRRomSize)
+					: prgCRC32;
+			}
+			else if (iNESCart.PRGRomSize == (uint32)rom_size_bytes &&
 				iNESCart.CHRRomSize == (uint32)vrom_size_bytes) {
 				combinedCRC32 = vrom_size_bytes
 					? CalcCRC32Combine(prgCRC32, chrCRC32, (uint64)vrom_size_bytes)
@@ -1769,16 +1868,16 @@ int iNESLoad(const char* name, FCEUFILE* fp, int OverwriteVidMode) {
 			if (totalHashBytes >= ultraPipelineThreshold) {
 				FCEUWinCngMD5 fastMd5;
 				if (fastMd5.init() &&
-					fastMd5.update(ROM, (uint32)rom_size_bytes) &&
-					(!vrom_size_bytes || fastMd5.update(VROM, (uint32)vrom_size_bytes)) &&
+					fastMd5.update(ROM, iNES2 ? (uint32)iNESCart.PRGRomSize : (uint32)rom_size_bytes) &&
+					(!vrom_size_bytes || fastMd5.update(VROM, iNES2 ? (uint32)iNESCart.CHRRomSize : (uint32)vrom_size_bytes)) &&
 					fastMd5.finish(iNESCart.MD5))
 					return;
 			}
 #endif
 			md5_starts(&md5);
-			md5_update(&md5, ROM, rom_size_bytes);
+			md5_update(&md5, ROM, iNES2 ? (uint32)iNESCart.PRGRomSize : rom_size_bytes);
 			if (vrom_size_bytes)
-				md5_update(&md5, VROM, vrom_size_bytes);
+				md5_update(&md5, VROM, iNES2 ? (uint32)iNESCart.CHRRomSize : vrom_size_bytes);
 			md5_finish(&md5, iNESCart.MD5);
 		};
 
@@ -1816,8 +1915,9 @@ int iNESLoad(const char* name, FCEUFILE* fp, int OverwriteVidMode) {
 	iNESCart.CRC32 = iNESGameCRC32;
 	}
 
-	FCEU_printf(" PRG ROM: %d x 16KiB = %d KiB\n", (round ? rom_size_bytes : not_round_size) >> 14, ((round ? rom_size_bytes : not_round_size) >> 14) * 16);
-	FCEU_printf(" CHR ROM: %d x  8KiB = %d KiB\n", (vrom_size_bytes >> 13), (vrom_size_bytes >> 13) * 8);
+	displayedPrgSize = iNES2 ? not_round_size : (round ? (uint64)rom_size_bytes : not_round_size);
+	FCEU_printf(" PRG ROM: %d x 16KiB = %d KiB\n", (int)(displayedPrgSize >> 14), (int)(displayedPrgSize >> 10));
+	FCEU_printf(" CHR ROM: %d KiB\n", (int)((iNES2 ? not_round_vrom_size : (uint64)vrom_size_bytes) >> 10));
 	FCEU_printf(" PRG-ROM CRC32:  0x%08X\n", iNESCart.PRGCRC32);
 	FCEU_printf(" CHR-ROM CRC32:  0x%08X\n", iNESCart.CHRCRC32);
 	FCEU_printf(" ROM CRC32: 0x%08x\n", iNESGameCRC32);
@@ -1852,19 +1952,8 @@ int iNESLoad(const char* name, FCEUFILE* fp, int OverwriteVidMode) {
 		FCEU_printf(" Sub Mapper #: %d\n", iNESCart.submapper);
 		FCEU_printf(" Total WRAM size: %d KiB\n", (iNESCart.wram_size + iNESCart.battery_wram_size) / 1024);
 		FCEU_printf(" Total VRAM size: %d KiB\n", (iNESCart.vram_size + iNESCart.battery_vram_size) / 1024);
-		iNESCart.PRGRomSize = ROM_size >= 0xF00 ? (pow(2, head.ROM_size >> 2) * ((head.ROM_size & 3) * 2 + 1)) : (ROM_size * 0x4000);
-		iNESCart.CHRRomSize = VROM_size >= 0xF00 ? (pow(2, head.VROM_size >> 2) * ((head.VROM_size & 3) * 2 + 1)) : (VROM_size * 0x2000);
-		iNESCart.miscROMNumber = head.misc_roms;
-		iNESCart.miscROMSize = iNESCart.miscROMNumber ? (iNESCart.totalFileSize - 16 - (head.ROM_type & 4 ? 512 : 0) - iNESCart.PRGRomSize - iNESCart.CHRRomSize) : 0;
-		if (iNESCart.miscROMSize & 0x8000000) {
-			iNESCart.miscROMSize = 0;
-		}
-		else {
-			//iNESCart.submapper = iNESCart.miscROMNumber = iNESCart.miscROMSize = 0
-			iNESCart.miscROMNumber = iNESCart.miscROMSize = 0;
-			iNESCart.PRGRomSize = ROM_size * 0x4000;
-			iNESCart.CHRRomSize = VROM_size * 0x2000;
-		}
+		iNESCart.miscROMNumber = head.misc_roms & 0x03;
+		iNESCart.miscROMSize = (int)MiscROM_size;
 		if (head.ROM_type & 2)
 		{
 			FCEU_printf(" WRAM backed by battery: %d KiB\n", iNESCart.battery_wram_size / 1024);
@@ -1880,10 +1969,12 @@ int iNESLoad(const char* name, FCEUFILE* fp, int OverwriteVidMode) {
 	FCEU_VSUniCheck(partialmd5, &MapperNo, &Mirroring);
 	CheckBad(partialmd5);
 
-	/* Must remain here because above functions might change value of
-	VROM_size and free(VROM).
-	*/
-	if (vrom_size_bytes)
+	/* Must remain here because above functions might change the logical CHR
+	 * ROM size and free VROM.  A non-null VROM pointer is also required: the
+	 * header correction path may intentionally remove a bad CHR-ROM region.
+	 * Do not use VROM_size here, since NES 2.0 CHR-ROM can be smaller than
+	 * the 8 KiB bank unit while still having a valid backing buffer. */
+	if (vrom_size_bytes && VROM && iNESCart.CHRRomSize > 0)
 		SetupCartCHRMapping(0, VROM, vrom_size_bytes, 0);
 
 	if (Mirroring == 2) {
@@ -2031,7 +2122,10 @@ static int iNES_Init(int num) {
 	while (tmp->init) {
 		if (num == tmp->number) {
 			UNIFchrrama = NULL;	// need here for compatibility with UNIF mapper code
-			if (!VROM_size) {
+			/* CHRRomSize is the logical byte count. VROM_size is an 8 KiB
+			 * mapper-bank count and can be zero for valid 1/2/4 KiB NES 2.0
+			 * CHR-ROM images. */
+			if (iNESCart.CHRRomSize <= 0) {
 				if(!iNESCart.ines2)
 				{
 					switch (num) {	// FIXME, mapper or game data base with the board parameters and ROM/RAM sizes
