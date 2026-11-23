@@ -205,6 +205,8 @@ void Mapper500_UNIF2_Init(CartInfo*);
 void Mapper500_UNIF3_Init(CartInfo*);
 void Mapper500_UNIF4_Init(CartInfo*);
 void Mapper500_UNIF5_Init(CartInfo*);
+void Mapper500_UNIF6_Init(CartInfo*);
+void Mapper500_UNIF7_Init(CartInfo*);
 
 
 extern uint8* UNIFchrrama;	// Meh.  So I can stop CHR RAM

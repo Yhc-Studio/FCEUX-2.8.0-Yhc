@@ -582,12 +582,6 @@ static BMAPPING bmap[] = {
 	{ "N49C-300", Mapper369_Init,0 },
 	{ "830752C", Mapper396_Init, 0 },
 	{ "22026", Mapper271_Init, 0 },
-	{ "Yhc-Axrom-Cart",     Mapper500_UNIF0_Init, 0 },
-	{ "Yhc-Unrom-Cart",     Mapper500_UNIF1_Init, 0 },
-	{ "Yhc-A/B/Uxrom-Cart", Mapper500_UNIF2_Init, 0 },
-	{ "Yhc-SmallGame-Cart", Mapper500_UNIF3_Init, 0 },
-	{ "Yhc-MMC1-Cart",  Mapper500_UNIF4_Init, 0 },
-	{ "Yhc-MMC3-Cart",  Mapper500_UNIF5_Init, 0 },
 	{ "S-2009", Mapper434_Init, 0 },
 	{ "WELL-NO-DG450", Mapper428_Init, 0 },
 	{ "AB-G1L", Mapper428_Init, 0 },
@@ -616,6 +610,14 @@ static BMAPPING bmap[] = {
 	{ "K-3010", Mapper438_Init, 0 },
 	{ "JY88S",  Mapper411_Init, 0 },
 	{ "K86B",  Mapper439_Init, 0 },
+	{ "Yhc-Axrom-Cart",     Mapper500_UNIF0_Init, 0 },
+	{ "Yhc-Unrom-Cart",     Mapper500_UNIF1_Init, 0 },
+	{ "Yhc-A/B/Uxrom-Cart", Mapper500_UNIF2_Init, 0 },
+	{ "Yhc-SmallGame-Cart", Mapper500_UNIF3_Init, 0 },
+	{ "Yhc-MMC1-Cart",  Mapper500_UNIF4_Init, 0 },
+	{ "Yhc-MMC3-Cart",  Mapper500_UNIF5_Init, 0 },
+	{ "Yhc-MMC5-Cart",  Mapper500_UNIF6_Init, 0 },
+	{ "Yhc-VRC-Hybrid-Cart",  Mapper500_UNIF7_Init, 0 },
 	{ 0, 0, 0 }
 };
 

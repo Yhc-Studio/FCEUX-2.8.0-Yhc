@@ -1,31 +1,31 @@
-# FCEUX 2.6.6 Yhc Version
+# FCEUX 2.8.0-Y330
 
-> An unofficial enhanced fork based on **FCEUX 2.6.6**, focused on emulator compatibility, NSF playback, PPU/video accuracy, input improvements, mapper support, and practical debugging/recording features.
+> 基于 **FCEUX 2.6.6** 长期维护的非官方增强版本，主要面向模拟器兼容性、NES/VTxx 硬件支持、NSF 播放、PPU/视频精度、输入系统、调试器、快进性能、大 ROM 支持以及录制功能的持续改进。
 
-> 基于 **FCEUX 2.6.6** 的非官方增强版本，主要面向模拟器兼容性、NSF 播放、PPU/视频精度、输入系统、Mapper 支持以及调试与录制功能的改进。
+## 项目简介
+
+FCEUX 2.8.0-Y330 是基于 FCEUX 2.6.6 源代码持续维护的自定义版本。
+
+本项目并不是对 FCEUX 进行大规模重写，而是在尽量保持原有使用习惯、Win32 界面和兼容性的基础上，对实际使用过程中发现的问题进行修正和增强。
+
+当前维护重点主要包括：
+
+- NSF / NSFe 播放器增强
+- PPU、Color 512 与视频显示修正
+- DirectInput 手柄与 Hotkey 改进
+- Tab Turbo / 3200% / 6400% 高速运行优化
+- Debugger 功能与滚动性能优化
+- UTF-8 / 中文 / 特殊字符文件名支持
+- 32MB～512MB 大 ROM 加载与内存释放优化
+- OneBus / VT03 / VT09 / VT32 / VT4FFx / VT369 支持
+- Mapper、扩展音源与多合一卡兼容性更新
+- AVI / NSF 界面录制与显示相关改进
 
 ---
 
-## 中文说明
+## 主要功能
 
-### 项目简介
-
-FCEUX 2.6.6 Yhc 是基于 FCEUX 2.6.6 源代码维护的自定义版本。
-
-本项目并不是对 FCEUX 进行大规模重写，而是在尽量保持原有使用习惯和兼容性的基础上，对实际使用中遇到的问题进行修正和增强。当前版本的主要修改集中在以下几个方向：
-
-- NSF / NSFe 播放器增强
-- PPU 与 Color 512 显示修正
-- 手柄快捷键支持
-- 鼠标 / 窗口焦点误触修复
-- 视频与调色板改进
-- AVI 录制相关增强
-- Mapper 与扩展音源兼容性改进
-- 一些针对特殊 ROM / Hack / 多合一游戏的兼容性修正
-
-### 主要功能
-
-#### 1. NSF / NSFe 播放器增强
+### 1. NSF / NSFe 播放器增强
 
 当前版本支持：
 
@@ -41,7 +41,7 @@ FCEUX 2.6.6 Yhc 是基于 FCEUX 2.6.6 源代码维护的自定义版本。
 - NSF 播放界面的手柄控制
 - 多扩展音源混合播放
 
-已针对以下扩展音源进行适配或兼容性修正：
+已经针对以下扩展音源进行适配或兼容性修正：
 
 - VRC6
 - VRC7
@@ -50,53 +50,69 @@ FCEUX 2.6.6 Yhc 是基于 FCEUX 2.6.6 源代码维护的自定义版本。
 - Namco 106 / N163
 - Sunsoft FME-7 / 5B
 
-其中也修复了部分组合扩展音源 NSF 中，某个音源被后初始化的音源覆盖、可视键盘与真实音频状态不一致等问题。
+同时修复了部分组合扩展音源 NSF 中，某个音源被后初始化音源覆盖、可视键盘与真实音频状态不一致等问题。
 
-#### 2. NSF 自定义播放速率
+### 2. NSF 自定义播放速率
 
 NSF Header 中的：
 
 - `NTSCspeed`
 - `PALspeed`
 
-现在会作为实际的 PLAY 调用间隔使用。
+会作为实际 PLAY 调用间隔使用。
 
-此前采用“按视频帧累计误差”的方式时，当 NSF 速率与视频刷新率存在轻微差异，会出现：
+旧的“按视频帧累计误差”方案在 NSF 速率与视频刷新率略有差异时，可能出现：
 
-- 某一帧连续执行两次 PLAY，听感像突然前进一帧
-- 某一帧不执行 PLAY，听感像某个声音多停留一帧
+- 某一帧连续执行两次 PLAY
+- 某一帧不执行 PLAY
+- 长时间播放后产生听感上的突然前进或停留
 
-典型情况包括：
+典型值例如：
 
 - `40FF`（16639 µs）
 - `4165`（16741 µs）
 
-当前版本已经改为更细粒度的 PLAY 调度，使 PLAY 调用不再被强制量化到整帧边界，从而避免长时间播放后突然跳过或额外停留一帧的问题。
+当前版本使用更细粒度的 PLAY 调度，避免把 PLAY 调用强制量化到整帧边界。
 
-#### 3. PPU / Color 512 修正
+---
 
-NEWPPU 的 Color 512 路径进行了多项修正，包括：
+### 3. PPU / Color 512 / 视频修正
+
+NEWPPU 与 Color 512 路径进行了多项修正，包括：
 
 - `$2001` 状态按 dot 处理
 - Grayscale 按 dot 生效
 - Color Emphasis 按 dot 生效
-- Emphasis 状态可以正确恢复到 0
+- Emphasis 状态正确恢复到 0
 - 强制空白期间的调色板读取状态修正
-- 避免后续 `$2007` 写入影响已经记录的像素
-- 修正部分渲染标志原本按 8 像素块处理的问题
-- 修正普通整数 2x / 3x 放大路径未正确读取 `XDBuf` 的问题
-- 调整 Color Emphasis 的亮度表现，避免强调色过暗
+- 避免后续 `$2007` 写入影响已记录像素
+- 修正部分渲染标志按 8 像素块处理的问题
+- 修正普通整数 2x / 3x 放大路径未正确读取 `XDBuf`
+- 调整 Color Emphasis 亮度，避免强调色过暗
+- VT369 RGB555 / Direct Color 显示路径
+- VT369 HUD / Overlay 生命周期与 ROM Close 清理
 
-#### 4. 手柄快捷键支持
+视频相关还包括：
 
-当前版本增加了 DirectInput 手柄快捷键支持，可绑定：
+- NTSC 2x 显示支持改进
+- PAL 3x 相关输出兼容
+- Digital Prime 调色板调整
+- Color 512 输出路径修正
+- 2x / 3x 整数缩放修正
+- 部分强调色与灰度显示问题修复
+
+---
+
+### 4. 手柄、Hotkey 与输入系统
+
+当前版本增加并完善了 DirectInput 手柄快捷键支持，可绑定：
 
 - 普通按钮
 - X / Y / Z 轴
 - Rx / Ry / Rz 轴
 - POV / Hat
 
-例如可以将以下功能绑定到手柄：
+例如可绑定：
 
 - Pause
 - Reset
@@ -107,88 +123,300 @@ NEWPPU 的 Color 512 路径进行了多项修正，包括：
 - Frame Advance
 - Turbo
 
-对于一次性快捷键与持续型快捷键，也分别处理：
+一次性快捷键与持续型快捷键分别处理：
 
-- Pause / Reset / Screenshot / Save / Load 等：按下一次只触发一次
-- Frame Advance / Turbo 等：保留按住行为
+- Pause / Reset / Screenshot / Save / Load：按下一次只触发一次
+- Frame Advance / Turbo：保留按住行为
 
-手柄绑定同时会保存设备 GUID，以提高重新启动模拟器后的设备匹配稳定性。
+手柄绑定会保存设备 GUID，提高重新启动后的设备匹配稳定性。
 
-> 注意：部分带有 M1 / M2 / M3 / M4 背键的手柄，如果驱动没有把这些按键作为独立 DirectInput Button 暴露给 Windows，则 FCEUX 无法直接识别这些按键。
+同时修复：
 
-#### 5. 鼠标与窗口焦点误触修复
+- 鼠标点击模拟器内部时误识别为 `JS 0 axis x+ / x-`
+- DirectInput `GetDeviceState()` 失败后全零状态被误认为有效输入
+- 点击桌面、任务栏或其他程序时误触 Save Slot 等快捷键
+- 从 Hotkey 设置窗口退出后，刚刚用于绑定的按钮立即触发功能
+- Turbo 高速运行时 Hotkey 全表反复扫描造成的性能开销
 
-修复了手柄 Hotkeys 加入后出现的一些 DirectInput 边界问题，包括：
+当前 Turbo 路径加入了：
 
-- 鼠标点击模拟器内部时，错误识别为 `JS 0 axis x+ / x-`
-- DirectInput `GetDeviceState()` 失败后，全零状态被误认为有效轴输入
-- 点击桌面、任务栏或其他程序时，错误触发 Save Slot 等快捷键
-- 从快捷键设置窗口返回后，刚刚用于绑定的按键立即触发对应功能
+- 空 Hotkey 映射快速返回
+- 纯键盘映射不进入 joystick 检查
+- Keyboard State Generation 缓存
+- Turbo 稳定状态 O(1) Hotkey fast path
+- Turbo Input Poll 降频
 
-当前版本在设备失去焦点、重新 Acquire 或读取失败时，会重新建立输入基准，避免生成虚假的轴方向或上升沿。
+> 注意：M1 / M2 / M3 / M4 等厂商自定义背键是否可用，取决于驱动是否将它们作为独立 DirectInput Button 暴露给 Windows。
 
-#### 6. 视频与调色板
+---
 
-视频相关修改包括：
+### 5. Tab Turbo 与高速运行优化
 
-- NTSC 2x 显示支持改进
-- Digital Prime 调色板相关调整
-- Color 512 输出路径修正
-- 2x / 3x 整数缩放路径修正
-- 部分强调色与灰度显示问题修复
+当前版本对 Tab Turbo 和高倍率运行进行了多轮性能优化。
 
-#### 7. AVI 录制
+支持：
 
-针对录制流程进行了一些增强与兼容性调整，包括：
+- 普通 Turbo
+- 3200%
+- 6400%
 
-- NSF 播放界面录制
-- NTSC 2x / PAL 3x 等输出场景
-- 自定义输出尺寸相关支持
-- 录制时的画面 / 声音同步修正
+主要优化包括：
 
-具体可用选项取决于当前 Win32 构建版本。
+- 普通 NES CPU fast path
+- `multiplier=1` 时避免每条 CPU 指令执行无意义除法 / 取模
+- 无 opcode encryption 时直接返回普通 opcode
+- 普通 NES PPU 使用独立 `pputile_novt.inc` 快路径
+- 非 VT 游戏跳过 VT369 专用 scanline / RGB555 / Overlay 缓冲处理
+- 非 VT 帧跳过 VT369 每像素 Overlay 查询
+- Turbo 下 Hotkey / Keyboard / DirectInput 减负
+- muteTurbo DirectSound steady-state bypass
+- 高速运行时重型工具窗口降频
+- 3200% / 6400% 独立视频刷新策略
+- Smooth Turbo：保持较高 FPS 的同时避免“冻结式跳帧”
 
-#### 8. Mapper 与兼容性更新
+在关闭滤镜和硬件加速等额外视频开销的情况下，普通游戏 Tab Turbo 可达到约 4000 FPS 级别；实际性能取决于 CPU、视频设置、滤镜、窗口缩放和游戏本身。
 
-本版本包含多项 Mapper 兼容性修正与新增支持。
+---
 
-已经处理过的 Mapper 包括但不限于：
+### 6. Debugger 增强
 
-`242`, `343`, `351`, `376`, `412`, `438`, `445`, `447`, `449`, `511`, `556`, `598`, `599`
+Debugger 进行了多项功能和性能改进。
 
-此外还进行了 MMC5、N163、VRC 系列及其他特殊 Mapper / 多合一 ROM 的兼容性调整。
+#### Bank Size
 
-部分修改主要用于：
+反汇编 Bank 显示支持：
 
-- PRG Bank 切换
-- CHR Bank 切换
+- 32KB
+- 16KB
+- 8KB
+
+Bank Size 会影响：
+
+- Bank:Address 显示
+- Symbolic Debug page
+- 鼠标悬停 Bank
+- `K==#xx` 断点条件
+- 地址换算逻辑
+
+#### Debugger Scroll Performance
+
+针对运行游戏时滚动反汇编窗口导致掉 FPS 的问题进行了优化：
+
+- `WM_VSCROLL / WM_MOUSEWHEEL` 高频事件合并
+- 运行中滚动预览约 33Hz
+- 滚动期间跳过完整语法高亮
+- 跳过 Symbolic name/comment 展开
+- 跳过 Code/Data Logger 左侧列重建
+- `SB_ENDSCROLL` 不重复完整刷新
+- 停止滚动约 120ms 后再完成完整高亮和正式提交
+- 暂停 / 单步状态仍保持即时完整刷新
+
+因此在拖动滚动条或使用鼠标滚轮浏览指令时，模拟器主游戏 FPS 不再出现明显下降。
+
+#### 其他调试修正
+
+- `$FFFF` 反汇编 Overflow 修正
+- VT opcode Debugger Guard
+- VT/OneBus opcode 解密调试支持
+- 中文 Debugger UI 保持兼容
+
+---
+
+### 7. UTF-8 与文件名支持
+
+Win32 文件访问路径进行了 UTF-8 / Unicode 兼容性修正。
+
+支持包含以下内容的 ROM / 存档 / 工程文件名：
+
+- 简体中文
+- 繁体中文
+- 日文
+- Unicode 特殊字符
+- 部分原来会导致 `Error Opening` 的历史 CJK 文件名
+
+相关文件访问路径逐步统一使用 UTF-8 aware wrapper，覆盖 ROM、Archive、Cheat、AVI、TAS Editor、Save 等常用路径。
+
+---
+
+### 8. 32MB～512MB 大 ROM 支持与性能优化
+
+针对现代大容量多合一卡和测试 ROM，增加了 32MB、64MB、128MB、256MB、512MB 文件加载优化。
+
+主要改进：
+
+- 32MB 起进入 Large-ROM fast path
+- plain `.nes` 大文件可跳过不必要的 7-Zip 全格式签名扫描
+- 大 ROM 缓冲使用未初始化分配，避免先清零整个 32～512MB 缓冲
+- Windows 大块缓冲使用 `VirtualAlloc`
+- ROM Close 使用 `VirtualFree(MEM_RELEASE)`
+- 8MB / 16MB 分块 streaming read
+- 读取过程中同步计算 CRC / Hash
+- 减少“完整读取后再扫描整份 ROM”的重复内存带宽消耗
+- 对大型 NES 2.0 现代 Mapper 可跳过不必要的 legacy MD5 流扫描
+- Code/Data Logger 大 ROM 缓冲在 ROM Close 时释放
+- ROM 关闭后执行 Heap / Working Set 收缩，减少任务管理器残留占用
+
+这一系列修改主要用于改善：
+
+- 32MB
+- 64MB
+- 128MB
+- 256MB
+- 512MB
+
+ROM 的打开速度、峰值内存占用和关闭后的内存归还。
+
+---
+
+### 9. OneBus / VTxx 支持
+
+当前维护线已经加入并持续完善 OneBus / VTxx 相关支持。
+
+#### VT03 / VT02
+
+已完成或修正：
+
+- VT03 renderer
+- VT02 / VT03 菜单与 HUD 颜色
+- Timer IRQ
+- DMA / CPU IRQ
+- PCM 相关基础支持
+- RetroGame / Samuri 等兼容性问题修正
+
+#### VT09
+
+- 基本显示支持
+- 与 VT03 / VT32 共用的 HUD / 颜色逻辑修正
+
+#### VT32
+
+已加入：
+
+- CPU / PPU 扩展
+- PCM / DMA / IRQ
+- packed graphics
+- HUD 修正
+- 动态图形行为
+- opcode encryption / Debugger Guard
+- 部分菜单移动时杂线和图像问题修正
+
+#### VT4FFx
+
+- OneBus 扩展相关兼容路径
+- 与 VT03 / VT32 / VT369 共用的 CPU / PPU / opcode 基础设施
+
+#### VT369
+
+已完成多个阶段的移植和实验性支持，包括：
+
+- Stage 1：CPU + Protection + RGB555 / PPU 基础增强
+- Stage 2：8bpp Background / Sprite Renderer
+- Enhanced Sprite / OAM
+- 64-byte NameTable
+- 16-bit Tile Number
+- 特殊 VRAM DMA
+- 高分辨率相关路径
+- Cube Tech / NubSup 启动与图形兼容实验
+- HUD / Overlay / Direct RGB555
+- ROM Close / frame ownership 清理
+- OAM512 / 128 Sprite
+- Standard Packed address alignment
+
+VT369 仍属于持续完善中的扩展硬件支持，部分特殊 ROM 可能仍存在图形、时序或 PCM 兼容性问题。
+
+---
+
+### 10. OneBus / VTxx 性能优化
+
+为了避免加入 VT03 / VT32 / VT4FFx / VT369 后影响普通 NES 游戏，当前版本加入了多层 Fast Path。
+
+#### 普通 NES Fast Path
+
+- 普通 CPU 不承担 VT opcode / multiplier 额外成本
+- 普通 PPU 不进入 VT tile / packed renderer 判断
+- 普通视频帧不处理 VT369 Direct RGB555 / Overlay
+- VT369 专用 framebuffer / scanline side buffer 只在需要时处理
+
+#### OneBus Active Fast Path
+
+- Dynamic CPU Hook
+- 只有 PCM / ALU / VT369 Sound HLE 活跃时才安装 OneBus CPU cycle hook
+- Power-of-Two CHR fast address
+- 常见 2 的幂 CHR 容量使用 `address & mask` 代替 `% size`
+- 非 2 的幂 ROM 自动回退原取模逻辑
+
+---
+
+### 11. Mapper 与兼容性更新
+
+本版本包含大量 Mapper 兼容性修正和新增支持。
+
+长期维护过的 Mapper 包括但不限于：
+
+`242`, `270`, `296`, `343`, `351`, `376`, `408`, `412`, `425`, `438`, `445`, `447`, `449`, `500`, `511`, `556`, `598`, `599`
+
+此外还对以下方向进行了持续适配：
+
+- MMC1
+- MMC3
+- MMC5
+- N163
+- VRC 系列
+- OneBus
+- VTxx
+- 特殊多合一卡
+- Split-ROM
+- PRG / CHR 大容量映射
 - Mirroring
 - IRQ
 - 扩展音频
-- Split-ROM / 多合一 ROM
 - 特殊寄存器响应
 
-### 编译
+---
 
-本项目基于 FCEUX 2.6.6 的源代码结构。
+### 12. AVI 录制
 
-Windows 版本建议使用与 FCEUX 2.6.6 源工程兼容的 Visual Studio 环境进行编译。
+录制相关改进包括：
+
+- NSF 播放界面录制
+- NTSC 2x / PAL 3x 输出
+- 自定义输出尺寸支持
+- 录制过程中的画面 / 声音同步修正
+- 高速模式与 AVI Dump 隔离，避免 Turbo / Frameskip 破坏录制确定性
+
+具体可用功能取决于当前 Win32 构建配置。
+
+---
+
+## 编译
+
+本项目仍基于 FCEUX 2.6.6 的源代码结构。
+
+Windows 版本建议使用 Visual Studio 2022 或与 FCEUX 2.6.6 Win32 工程兼容的 Visual Studio 环境。
 
 基本流程：
 
 1. 获取完整源代码。
 2. 打开 Win32 / Visual Studio 工程。
-3. 确认 DirectX / DirectInput 等依赖可用。
-4. 选择 Release 或 Debug 配置。
+3. 确认 Windows SDK、DirectX / DirectInput 等依赖可用。
+4. 推荐选择 `Release | x64`。
 5. 编译生成 FCEUX 可执行文件。
 
-如果使用的是较新的 Visual Studio，可能需要针对旧工程格式、Windows SDK 或旧版依赖进行少量兼容性调整。
+Release 构建建议保持：
 
-### 使用说明
+- `/O2`
+- `/Oi`
+- `/Ob2`
+- `/GL`
+- `/LTCG`
+- Favor Speed
+- Whole Program Optimization
 
-本版本总体保持 FCEUX 原有操作习惯。
+---
 
-建议在升级到新版本后重新检查：
+## 使用建议
+
+升级版本后建议重新检查：
 
 - Input
 - Hotkeys
@@ -196,257 +424,60 @@ Windows 版本建议使用与 FCEUX 2.6.6 源工程兼容的 Visual Studio 环�
 - Video
 - NSF Playback
 - Background Input
-
-等选项。
+- Debugger Bank Size
+- Turbo / Frame Skip
+- Filter / Hardware Acceleration
 
 如果旧配置文件中保存了已经不存在的手柄设备，建议重新进入 Hotkeys 或 Input 设置进行绑定。
 
-### 已知限制
+为了获得更高的 Tab Turbo 峰值性能，可适当减少：
+
+- 视频滤镜
+- 复杂缩放
+- 硬件加速额外开销
+- Debugger / PPU Viewer / Trace Logger 等实时工具窗口
+
+---
+
+## 已知限制
 
 - M1 / M2 / M3 / M4 等厂商自定义背键是否可用，取决于驱动是否将其作为独立 DirectInput Button 暴露。
 - 部分极少见 Mapper / 多合一 ROM 仍可能存在兼容性问题。
-- NSF 扩展音源组合较多，不同文件可能使用非常规寄存器写法，仍可能需要单独适配。
+- NSF 扩展音源组合较多，不同文件可能使用非常规寄存器写法。
+- VT369 仍属于持续完善中的实验性支持，部分 ROM 可能存在图形、HUD、PCM 或时序差异。
+- 512MB 级 ROM 的实际加载性能仍受磁盘速度、Windows 文件缓存和杀毒软件扫描影响。
 - 本项目属于非官方 FCEUX 分支，不代表 FCEUX 官方行为。
 
-### 问题反馈
+---
+
+## 问题反馈
 
 提交问题时建议附带：
 
 - ROM / NSF 的准确名称
-- Mapper 编号
+- Mapper / Submapper
 - 使用的 FCEUX 构建版本
 - 是否启用 New PPU
+- 是否属于 VT03 / VT09 / VT32 / VT369
 - 重现步骤
 - Debugger / Trace Logger 信息
-- 必要时附带存档、FM2、NSF 或截图
+- 是否开启 Filter / Hardware Acceleration
+- 必要时附带存档、FM2、NSF、WAV 或截图
 
-### 致谢
+---
+
+## 致谢
 
 感谢 FCEUX 原项目及其历代开发者。
 
 本项目中的大量功能仍建立在 FCEUX 原有 CPU / PPU 模拟、APU、Debugger、Trace Logger、TAS、Movie、NSF 与 Mapper 基础设施之上。
 
----
-
-## English
-
-### About
-
-FCEUX 2.6.6 Yhc is an unofficial custom build based on the FCEUX 2.6.6 source tree.
-
-The goal of this fork is not to rewrite FCEUX from scratch. Instead, it keeps the original workflow and compatibility as much as possible while fixing practical issues found during real-world use.
-
-The current version mainly focuses on:
-
-- NSF / NSFe player improvements
-- PPU and Color 512 accuracy fixes
-- Gamepad hotkey support
-- Mouse / focus false-input fixes
-- Video and palette improvements
-- AVI recording enhancements
-- Mapper and expansion-audio compatibility
-- Compatibility fixes for special ROM hacks and multicarts
-
-### Main Features
-
-#### 1. Enhanced NSF / NSFe Player
-
-Current features include:
-
-- NSF and NSFe playback
-- Song / artist / copyright information
-- NSFe track labels
-- Track time and fade information
-- Play / Pause / Stop controls
-- Waveform display
-- Virtual keyboard display
-- Peak / RMS meters
-- Expansion-audio status display
-- Gamepad control in the NSF player
-- Multiple expansion-audio chips in one NSF
-
-Expansion audio compatibility work includes:
-
-- VRC6
-- VRC7
-- FDS
-- MMC5
-- Namco 106 / N163
-- Sunsoft FME-7 / 5B
-
-Several mixed-expansion NSF issues were also fixed, including cases where one sound core overwrote another during initialization or where the visual keyboard did not match the actual audio state.
-
-#### 2. NSF Custom Playback Rates
-
-The NSF header fields `NTSCspeed` and `PALspeed` are now used as actual PLAY-call intervals.
-
-The previous frame-based scheduler could accumulate timing error when the NSF playback rate differed slightly from the emulator video refresh rate. This could eventually cause:
-
-- two PLAY calls in one video frame, sounding like a one-frame skip
-- no PLAY call in one video frame, making a sound last one extra frame
-
-Typical examples:
-
-- `40FF` (16639 µs)
-- `4165` (16741 µs)
-
-The current version uses a finer-grained PLAY scheduler so NSF PLAY calls are no longer forced onto whole video-frame boundaries.
-
-#### 3. PPU / Color 512 Fixes
-
-Several fixes were made to the NEWPPU Color 512 path:
-
-- per-dot `$2001` state handling
-- per-dot grayscale
-- per-dot color emphasis
-- correct emphasis return to zero
-- forced-blank palette handling fixes
-- protection against later `$2007` writes affecting already-recorded pixels
-- rendering flags no longer being limited to 8-pixel blocks
-- fixed normal integer 2x / 3x scaling paths that previously ignored `XDBuf`
-- adjusted color-emphasis brightness to avoid overly dark output
-
-#### 4. Gamepad Hotkeys
-
-This fork adds DirectInput gamepad hotkey support for:
-
-- normal buttons
-- X / Y / Z axes
-- Rx / Ry / Rz axes
-- POV / Hat input
-
-Commands such as the following can be bound to a controller:
-
-- Pause
-- Reset
-- Save State
-- Load State
-- Save Slot
-- Screenshot
-- Frame Advance
-- Turbo
-
-One-shot and held commands are handled separately:
-
-- Pause / Reset / Screenshot / Save / Load: fire once per press
-- Frame Advance / Turbo: keep held behavior
-
-Controller bindings also retain the device GUID to improve device matching after restarting the emulator.
-
-> Note: M1 / M2 / M3 / M4 rear buttons can only be detected if the controller driver exposes them as independent DirectInput buttons.
-
-#### 5. Mouse and Focus False-Input Fixes
-
-Several DirectInput edge cases introduced by gamepad hotkeys were fixed:
-
-- clicking inside the emulator being detected as `JS 0 axis x+ / x-`
-- failed `GetDeviceState()` calls producing a false zero-axis state
-- clicking the desktop, taskbar, or another application triggering Save Slot or other hotkeys
-- the button used in the hotkey configuration dialog immediately firing after leaving the dialog
-
-When the device loses focus, is reacquired, or fails to return a valid state, the input baseline is rebuilt so no fake axis direction or rising edge is generated.
-
-#### 6. Video and Palette
-
-Video-related work includes:
-
-- improved NTSC 2x output
-- Digital Prime palette adjustments
-- Color 512 output fixes
-- integer 2x / 3x scaling fixes
-- grayscale and emphasis corrections
-
-#### 7. AVI Recording
-
-The recording path also includes several improvements and compatibility adjustments, including:
-
-- recording the NSF player interface
-- NTSC 2x / PAL 3x output cases
-- custom output-size support
-- video / audio synchronization fixes during recording
-
-Available options may vary depending on the current Win32 build.
-
-#### 8. Mapper and Compatibility Updates
-
-This fork contains a number of mapper additions and compatibility fixes.
-
-Mappers that have received work include, but are not limited to:
-
-`242`, `343`, `351`, `376`, `412`, `438`, `445`, `447`, `449`, `511`, `556`, `598`, `599`
-
-Additional compatibility work has also been done for MMC5, N163, VRC-series hardware, special multicarts, and unusual ROM layouts.
-
-Areas covered include:
-
-- PRG banking
-- CHR banking
-- mirroring
-- IRQ behavior
-- expansion audio
-- split-ROM / multicart layouts
-- special register behavior
-
-### Building
-
-This project follows the FCEUX 2.6.6 source layout.
-
-For Windows builds, use a Visual Studio environment compatible with the original FCEUX 2.6.6 Win32 project.
-
-Basic steps:
-
-1. Obtain the full source tree.
-2. Open the Win32 / Visual Studio project.
-3. Make sure DirectX / DirectInput dependencies are available.
-4. Select a Release or Debug configuration.
-5. Build the FCEUX executable.
-
-Newer Visual Studio versions may require small compatibility adjustments for older project formats, Windows SDK versions, or legacy dependencies.
-
-### Usage Notes
-
-This fork keeps the general FCEUX workflow unchanged.
-
-After upgrading, it is recommended to review:
-
-- Input
-- Hotkeys
-- Sound
-- Video
-- NSF Playback
-- Background Input
-
-If an old configuration contains controller mappings for devices that are no longer present, rebind them in the Input or Hotkeys dialog.
-
-### Known Limitations
-
-- Vendor-specific M1 / M2 / M3 / M4 rear buttons are only available when exposed as independent DirectInput buttons.
-- Some uncommon mappers and multicart layouts may still require additional compatibility work.
-- Mixed-expansion NSF files may use unusual register behavior and can still require file-specific fixes.
-- This is an unofficial FCEUX fork and does not represent official FCEUX behavior.
-
-### Bug Reports
-
-When reporting an issue, please include:
-
-- exact ROM / NSF name
-- mapper number
-- FCEUX build/version
-- whether New PPU is enabled
-- reproduction steps
-- Debugger / Trace Logger information
-- savestate, FM2, NSF, or screenshots when necessary
-
-### Credits
-
-Thanks to the original FCEUX project and all of its contributors.
-
-This fork continues to rely heavily on FCEUX's existing CPU / PPU emulation, APU, Debugger, Trace Logger, TAS tools, Movie system, NSF player, and Mapper infrastructure.
+同时感谢相关 NES / OneBus / VTxx 文档、模拟器实现和测试 ROM 对硬件行为研究提供的参考。
 
 ---
 
 ## License
 
-This project is derived from FCEUX and follows the licensing terms of the original FCEUX source code and the individual source files included in the repository.
+本项目基于 FCEUX 源代码派生，并遵循原 FCEUX 项目及各源文件所声明的许可条款。
 
-Please refer to the source headers and the upstream FCEUX project for full license details.
+请参考源代码文件头和 FCEUX 上游项目获取完整许可证信息。
