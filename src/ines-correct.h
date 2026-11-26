@@ -125,6 +125,7 @@
 	{ 0x496ac8f7,	 74,	   -1 },	/* Ji Jia Zhan Shi (As) */
 	{ 0xae854cef,	 74,	   -1 },	/* Jia A Fung Yun (Chinese) */
 	{ 0x3d1c3137,	 78,		8 },	/* Uchuusen - Cosmo Carrier */
+	{ 0xba51ac6f,	 78,		0 },	/* Holy Diver */
 	{ 0xa4fbb438,	 79,		0 },
 	{ 0xd4a76b07,	 79,		0 },	/* F-15 City Wars*/
 	{ 0x1eb4a920,	 79,		1 },	/* Double Strike */
