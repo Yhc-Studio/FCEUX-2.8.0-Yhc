@@ -430,6 +430,9 @@
     <ClCompile Include="..\src\drivers\win\video.cpp">
       <Filter>drivers\win</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\drivers\win\d3d9.cpp">
+      <Filter>drivers\win</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\drivers\win\wave.cpp">
       <Filter>drivers\win</Filter>
     </ClCompile>
@@ -2199,6 +2202,9 @@
       <Filter>drivers\win</Filter>
     </ClInclude>
     <ClInclude Include="..\src\drivers\win\video.h">
+      <Filter>drivers\win</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\drivers\win\fceux_d3d9.h">
       <Filter>drivers\win</Filter>
     </ClInclude>
     <ClInclude Include="..\src\drivers\win\wave.h">

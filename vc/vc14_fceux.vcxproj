@@ -952,6 +952,7 @@ xcopy /y /d "$(ProjectDir)\..\src\drivers\win\7z_64.dll" "$(OutDir)"</Command>
     <ClCompile Include="..\src\drivers\win\timing.cpp" />
     <ClCompile Include="..\src\drivers\win\tracer.cpp" />
     <ClCompile Include="..\src\drivers\win\video.cpp" />
+    <ClCompile Include="..\src\drivers\win\d3d9.cpp" />
     <ClCompile Include="..\src\drivers\win\wave.cpp" />
     <ClCompile Include="..\src\drivers\win\Win32InputBox.cpp" />
     <ClCompile Include="..\src\drivers\win\window.cpp" />
@@ -1446,6 +1447,7 @@ xcopy /y /d "$(ProjectDir)\..\src\drivers\win\7z_64.dll" "$(OutDir)"</Command>
     <ClInclude Include="..\src\drivers\win\timing.h" />
     <ClInclude Include="..\src\drivers\win\tracer.h" />
     <ClInclude Include="..\src\drivers\win\video.h" />
+    <ClInclude Include="..\src\drivers\win\fceux_d3d9.h" />
     <ClInclude Include="..\src\drivers\win\wave.h" />
     <ClInclude Include="..\src\drivers\win\Win32InputBox.h" />
     <ClInclude Include="..\src\drivers\win\window.h" />
