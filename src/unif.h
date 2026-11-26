@@ -184,7 +184,6 @@ void BMCGN26_Init(CartInfo* info);
 void BMCL6IN1_Init(CartInfo* info);
 void NC7000M_Init(CartInfo* info);
 void BMC_971107_00G_Init(CartInfo* info);
-void Nrom_Cnrom_Cart_Init(CartInfo* info);
 void UNLBJ56_Init(CartInfo* info);
 void UNLAX40G_Init(CartInfo* info);
 void UNLTH21311_Init(CartInfo* info);
@@ -211,3 +210,13 @@ void Mapper500_UNIF7_Init(CartInfo*);
 
 extern uint8* UNIFchrrama;	// Meh.  So I can stop CHR RAM
 // bank switcherooing with certain boards...
+
+
+/* UNIF logical image view for tools.  These sizes describe only PRGx/CHRx
+ * payload bytes from the UNIF file and intentionally do not follow runtime
+ * cart mapping padding/expansion in PRGsize[] / CHRsize[]. */
+int FCEU_UNIFIsLoaded(void);
+uint32 FCEU_UNIFGetPRGROMSize(void);
+uint32 FCEU_UNIFGetCHRROMSize(void);
+uint8* FCEU_UNIFGetPRGROMPointer(void);
+uint8* FCEU_UNIFGetCHRROMPointer(void);

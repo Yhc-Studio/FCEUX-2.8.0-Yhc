@@ -38,6 +38,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <climits>
+#include <cstdint>
 
 typedef struct {
 	char ID[4];
@@ -82,14 +84,52 @@ static uint32 chr_chip_count;
 
 static uint64 UNIF_PRGROMSize, UNIF_CHRROMSize;
 
-static int FixRomSize(uint32 size, uint32 minimum) {
-	uint32 x = 1;
+/* Logical UNIF payload sizes are kept separate from the cart mapping sizes.
+ * PRGsize[0]/CHRsize[0] may be rounded up or changed by board init code,
+ * but tools such as the Hex Editor must show only the bytes that actually
+ * came from PRGx/CHRx chunks. */
+static uint32 UNIF_LogicalPRGROMSize;
+static uint32 UNIF_LogicalCHRROMSize;
+static int UNIF_ImageLoaded;
 
+int FCEU_UNIFIsLoaded(void) { return UNIF_ImageLoaded; }
+uint32 FCEU_UNIFGetPRGROMSize(void) { return UNIF_LogicalPRGROMSize; }
+uint32 FCEU_UNIFGetCHRROMSize(void) { return UNIF_LogicalCHRROMSize; }
+uint8* FCEU_UNIFGetPRGROMPointer(void) { return UNIF_ImageLoaded ? ROM : 0; }
+uint8* FCEU_UNIFGetCHRROMPointer(void) { return UNIF_ImageLoaded ? VROM : 0; }
+
+/* Round a ROM payload up to a power of two without allowing the old
+ * uint32/int wraparound.  The cart mapping API still uses uint32 byte
+ * sizes, so reject anything whose rounded backing store cannot be
+ * represented there. */
+static int FixRomSize(uint64 size, uint32 minimum, uint32* out) {
+	uint64 x = 1;
+
+	if (!out)
+		return 0;
 	if (size < minimum)
-		return minimum;
-	while (x < size)
+		size = minimum;
+
+	while (x < size) {
+		if (x > (uint64)UINT32_MAX / 2ULL)
+			return 0;
 		x <<= 1;
-	return x;
+	}
+	if (x > UINT32_MAX)
+		return 0;
+
+	*out = (uint32)x;
+	return 1;
+}
+
+static int UNIFSeekAbsolute(FCEUFILE* fp, uint64 pos) {
+	/* FCEU_fseek currently accepts a signed long.  All practical UNIF ROMs
+	 * supported by this branch (including 512 MiB images) fit comfortably
+	 * below LONG_MAX on Win32/Win64. */
+	if (!fp || pos > (uint64)LONG_MAX)
+		return 0;
+	FCEU_fseek(fp, (long)pos, SEEK_SET);
+	return FCEU_ftell(fp) == pos;
 }
 
 static int UNIFChunkIndex(void) {
@@ -123,6 +163,9 @@ static void FreeUNIF(void) {
 	if (VROM) {
 		free(VROM); VROM = 0;
 	}
+	UNIF_ImageLoaded = 0;
+	UNIF_LogicalPRGROMSize = 0;
+	UNIF_LogicalCHRROMSize = 0;
 }
 
 static void ResetUNIF(void) {
@@ -144,6 +187,9 @@ static void ResetUNIF(void) {
 	chr_chip_count = 0;
 	UNIF_PRGROMSize = 0;
 	UNIF_CHRROMSize = 0;
+	UNIF_LogicalPRGROMSize = 0;
+	UNIF_LogicalCHRROMSize = 0;
+	UNIF_ImageLoaded = 0;
 	ROM_size = 0;
 	VROM_size = 0;
 }
@@ -176,12 +222,15 @@ static int DoMirroring(FCEUFILE* fp) {
 		}
 	}
 	else {
-		FCEU_printf(" Incorrect Mirroring Chunk Size (%d). Data is:", uchead.info);
-		for (i = 0; i < uchead.info; i++) {
+		uint32 shown = (uchead.info < 32) ? uchead.info : 32;
+		FCEU_printf(" Incorrect Mirroring Chunk Size (%u). Data is:", uchead.info);
+		for (i = 0; i < shown; i++) {
 			if ((t = FCEU_fgetc(fp)) == EOF)
 				return(0);
 			FCEU_printf(" %02x", t);
 		}
+		if (shown < uchead.info)
+			FCEU_printf(" ...");
 		FCEU_printf("\n Default Name/Attribute Table Mirroring: Horizontal\n");
 		mirrortodo = 0;
 	}
@@ -190,24 +239,38 @@ static int DoMirroring(FCEUFILE* fp) {
 
 static int NAME(FCEUFILE* fp) {
 	char namebuf[100];
-	int index;
+	int index = 0;
 	int t;
+	uint32 left = uchead.info;
+	int saw_nul = 0;
 
 	FCEU_printf(" Name: ");
-	index = 0;
 
-	while ((t = FCEU_fgetc(fp)) > 0)
+	/* Never search for NUL past the end of the NAME chunk.  Older code kept
+	 * reading into the next chunk when a malformed NAME lacked a terminator,
+	 * desynchronising the entire UNIF stream. */
+	while (left--) {
+		t = FCEU_fgetc(fp);
+		if (t == EOF)
+			return 0;
+		if (t == 0) {
+			saw_nul = 1;
+			break;
+		}
 		if (index < 99)
-			namebuf[index++] = t;
+			namebuf[index++] = (char)t;
+	}
 
 	namebuf[index] = 0;
-	FCEU_printf("%s\n", namebuf);
+	FCEU_printf("%s%s\n", namebuf, saw_nul ? "" : " [unterminated NAME chunk]");
 
 	if (!GameInfo->name) {
-		GameInfo->name = (uint8*)malloc(strlen(namebuf) + 1); //mbg merge 7/17/06 added cast
-		strcpy((char*)GameInfo->name, namebuf); //mbg merge 7/17/06 added cast
+		GameInfo->name = (uint8*)malloc(strlen(namebuf) + 1);
+		if (!GameInfo->name)
+			return 0;
+		strcpy((char*)GameInfo->name, namebuf);
 	}
-	return(1);
+	return 1;
 }
 static void Cleanup(void) {
 	FreeUNIF();
@@ -219,6 +282,12 @@ static int DINF(FCEUFILE* fp) {
 	uint16 y;
 	int t;
 
+	/* Standard DINF payload is exactly 204 bytes.  Accept trailing extension
+	 * bytes for compatibility, but never read beyond a short chunk. */
+	if (uchead.info < 204) {
+		FCEU_printf(" Invalid DINF chunk size: %u (expected at least 204).\n", uchead.info);
+		return 0;
+	}
 	if (FCEU_fread(name, 1, 100, fp) != 100)
 		return(0);
 	if ((t = FCEU_fgetc(fp)) == EOF) return(0);
@@ -239,7 +308,8 @@ static int DINF(FCEUFILE* fp) {
 			"January", "February", "March", "April", "May", "June", "July",
 			"August", "September", "October", "November", "December"
 		};
-		FCEU_printf(" Dumped on: %s %d, %d\n", months[(m - 1) % 12], d, y);
+		const char* month = (m >= 1 && m <= 12) ? months[m - 1] : "Unknown";
+		FCEU_printf(" Dumped on: %s %d, %d\n", month, d, y);
 	}
 	return(1);
 }
@@ -247,6 +317,8 @@ static int DINF(FCEUFILE* fp) {
 static int CTRL(FCEUFILE* fp) {
 	int t;
 	uint32 i;
+	if (uchead.info == 0)
+		return 0;
 	if (uchead.info == 1) {
 		if ((t = FCEU_fgetc(fp)) == EOF)
 			return(0);
@@ -262,11 +334,15 @@ static int CTRL(FCEUFILE* fp) {
 			GameInfo->input[1] = SI_ZAPPER;
 	}
 	else {
-		FCEU_printf(" Incorrect Control Chunk Size (%d). Data is:", uchead.info);
-		for (i = 0; i < uchead.info; i++) {
+		uint32 shown = (uchead.info < 32) ? uchead.info : 32;
+		FCEU_printf(" Incorrect Control Chunk Size (%u). Data is:", uchead.info);
+		for (i = 0; i < shown; i++) {
 			t = FCEU_fgetc(fp);
+			if (t == EOF) return 0;
 			FCEU_printf(" %02x", t);
 		}
+		if (shown < uchead.info)
+			FCEU_printf(" ...");
 		FCEU_printf("\n");
 		GameInfo->input[0] = GameInfo->input[1] = SI_GAMEPAD;
 	}
@@ -275,6 +351,8 @@ static int CTRL(FCEUFILE* fp) {
 
 static int TVCI(FCEUFILE* fp) {
 	int t;
+	if (uchead.info < 1)
+		return 0;
 	if ((t = FCEU_fgetc(fp)) == EOF)
 		return(0);
 	if (t <= 2) {
@@ -294,6 +372,8 @@ static int TVCI(FCEUFILE* fp) {
 
 static int EnableBattery(FCEUFILE* fp) {
 	FCEU_printf(" Battery-backed.\n");
+	if (uchead.info < 1)
+		return 0;
 	if (FCEU_fgetc(fp) == EOF)
 		return(0);
 	UNIFCart.battery = 1;
@@ -313,8 +393,16 @@ static int LoadPRG(FCEUFILE* fp) {
 		FCEU_printf(" Duplicate PRG ROM %X chunk.\n", z);
 		return(0);
 	}
+	if (!uchead.info) {
+		FCEU_printf(" Empty PRG ROM %X chunk.\n", z);
+		return 0;
+	}
+	if (UNIF_PRGROMSize + (uint64)uchead.info > UINT32_MAX) {
+		FCEU_printf(" UNIF PRG payload exceeds 32-bit cart mapping limit.\n");
+		return 0;
+	}
 
-	FCEU_printf(" PRG ROM %X size: %d KiB", z, ((int)uchead.info) / 1024);
+	FCEU_printf(" PRG ROM %X size: %u KiB", z, uchead.info / 1024);
 	if (!(malloced[z] = (uint8*)FCEU_malloc(uchead.info)))
 		return(0);
 	mallocedsizes[z] = uchead.info;
@@ -333,13 +421,28 @@ static int LoadPRG(FCEUFILE* fp) {
 }
 
 static int SetBoardName(FCEUFILE* fp) {
-	if (!(boardname = (uint8*)FCEU_malloc(uchead.info + 1)))
+	/* Real board names are tiny.  A multi-megabyte MAPR is necessarily a
+	 * corrupt/desynchronised chunk and must not be used as an allocation size. */
+	static const uint32 MAX_UNIF_BOARD_NAME = 4096;
+	if (!uchead.info || uchead.info > MAX_UNIF_BOARD_NAME) {
+		FCEU_printf(" Invalid MAPR chunk size: %u.\n", uchead.info);
+		return 0;
+	}
+
+	size_t allocSize = (size_t)uchead.info + 1U;
+	if (allocSize <= (size_t)uchead.info)
+		return 0;
+	if (!(boardname = (uint8*)FCEU_malloc(allocSize)))
 		return(0);
-	FCEU_fread(boardname, 1, uchead.info, fp);
+	if (FCEU_fread(boardname, 1, uchead.info, fp) != uchead.info)
+		return 0;
 	boardname[uchead.info] = 0;
 	FCEU_printf(" Board name: %s\n", boardname);
 	sboardname = boardname;
-	if (!memcmp(boardname, "NES-", 4) || !memcmp(boardname, "UNL-", 4) || !memcmp(boardname, "HVC-", 4) || !memcmp(boardname, "BTL-", 4) || !memcmp(boardname, "BMC-", 4))
+	if (uchead.info >= 4 &&
+		(!memcmp(boardname, "NES-", 4) || !memcmp(boardname, "UNL-", 4) ||
+			!memcmp(boardname, "HVC-", 4) || !memcmp(boardname, "BTL-", 4) ||
+			!memcmp(boardname, "BMC-", 4)))
 		sboardname += 4;
 	return(1);
 }
@@ -357,8 +460,16 @@ static int LoadCHR(FCEUFILE* fp) {
 		FCEU_printf(" Duplicate CHR ROM %X chunk.\n", z);
 		return(0);
 	}
+	if (!uchead.info) {
+		FCEU_printf(" Empty CHR ROM %X chunk.\n", z);
+		return 0;
+	}
+	if (UNIF_CHRROMSize + (uint64)uchead.info > UINT32_MAX) {
+		FCEU_printf(" UNIF CHR payload exceeds 32-bit cart mapping limit.\n");
+		return 0;
+	}
 
-	FCEU_printf(" CHR ROM %X size: %d", z, (int)uchead.info);
+	FCEU_printf(" CHR ROM %X size: %u", z, uchead.info);
 	if (!(malloced[16 + z] = (uint8*)FCEU_malloc(uchead.info)))
 		return(0);
 	mallocedsizes[16 + z] = uchead.info;
@@ -637,15 +748,34 @@ static BFMAPPING bfunc[] = {
 int LoadUNIFChunks(FCEUFILE* fp) {
 	int x;
 	int t;
-	for (;; ) {
-		t = FCEU_fread(&uchead, 1, 4, fp);
-		if (t < 4) {
-			if (t > 0)
-				return 0;
+	const uint64 fileSize = FCEU_fgetsize(fp);
+
+	for (;;) {
+		const uint64 headerPos = FCEU_ftell(fp);
+		if (headerPos == fileSize)
 			return 1;
-		}
-		if (!(FCEU_read32le(&uchead.info, fp)))
+		if (headerPos > fileSize || fileSize - headerPos < 8) {
+			FCEU_printf(" Truncated UNIF chunk header at 0x%llX.\n", (unsigned long long)headerPos);
 			return 0;
+		}
+
+		t = (int)FCEU_fread(&uchead, 1, 4, fp);
+		if (t != 4)
+			return 0;
+		if (!FCEU_read32le(&uchead.info, fp))
+			return 0;
+
+		const uint64 chunkStart = FCEU_ftell(fp);
+		const uint64 chunkSize = (uint64)uchead.info;
+		if (chunkStart > fileSize || chunkSize > fileSize - chunkStart) {
+			char id[5] = { uchead.ID[0], uchead.ID[1], uchead.ID[2], uchead.ID[3], 0 };
+			FCEU_printf(" Invalid UNIF chunk %s at 0x%llX: size 0x%08X exceeds remaining file bytes 0x%llX.\n",
+				id, (unsigned long long)headerPos, uchead.info,
+				(unsigned long long)(fileSize - chunkStart));
+			return 0;
+		}
+		const uint64 chunkEnd = chunkStart + chunkSize;
+
 		t = 0;
 		x = 0;
 		while (bfunc[x].name) {
@@ -657,64 +787,114 @@ int LoadUNIFChunks(FCEUFILE* fp) {
 			}
 			x++;
 		}
-		if (!t)
-			if (FCEU_fseek(fp, uchead.info, SEEK_CUR) < 0)
-				return(0);
+
+		/* Every chunk handler is confined to [chunkStart, chunkEnd).  Short
+		 * reads are completed by seeking to chunkEnd; over-reads are fatal. */
+		const uint64 after = FCEU_ftell(fp);
+		if (after > chunkEnd) {
+			char id[5] = { uchead.ID[0], uchead.ID[1], uchead.ID[2], uchead.ID[3], 0 };
+			FCEU_printf(" UNIF chunk %s over-read: end=0x%llX current=0x%llX.\n",
+				id, (unsigned long long)chunkEnd, (unsigned long long)after);
+			return 0;
+		}
+		if (after < chunkEnd && !UNIFSeekAbsolute(fp, chunkEnd))
+			return 0;
+
+		(void)t; /* Unknown chunks are intentionally skipped to chunkEnd. */
 	}
 }
 
 static int CombineUNIFROMs(void) {
 	uint64 prg_write = 0;
 	uint64 chr_write = 0;
-	uint64 prg_size = 0;
-	uint64 chr_size = 0;
+	uint32 prg_size = 0;
+	uint32 chr_size = 0;
+	const uint64 prg_payload = UNIF_PRGROMSize;
+	const uint64 chr_payload = UNIF_CHRROMSize;
 	int x;
 
-	if (!UNIF_PRGROMSize)
+	if (prg_payload > UINT32_MAX || chr_payload > UINT32_MAX) {
+		FCEU_printf(" UNIF logical PRG/CHR payload exceeds tool address range.\n");
+		return 0;
+	}
+	UNIF_LogicalPRGROMSize = (uint32)prg_payload;
+	UNIF_LogicalCHRROMSize = (uint32)chr_payload;
+
+	if (!prg_payload)
 		return 0;
 
-	prg_size = FixRomSize((uint32)UNIF_PRGROMSize, 2048);
-	if (!(ROM = (uint8*)FCEU_malloc((uint32)prg_size)))
+	if (!FixRomSize(prg_payload, 2048, &prg_size)) {
+		FCEU_printf(" UNIF PRG image is too large to map safely.\n");
 		return 0;
-	memset(ROM, 0xFF, (uint32)prg_size);
+	}
+	if (!(ROM = (uint8*)FCEU_malloc(prg_size)))
+		return 0;
+	memset(ROM, 0xFF, prg_size);
 
 	for (x = 0; x < (int)prg_chip_count; x++) {
 		int p = prg_idx[x];
 
 		if (malloced[p]) {
-			memcpy(ROM + prg_write, malloced[p], mallocedsizes[p]);
-			prg_write += mallocedsizes[p];
+			const uint64 bytes = mallocedsizes[p];
+			if (prg_write > prg_size || bytes > (uint64)prg_size - prg_write) {
+				FCEU_printf(" UNIF PRG combine overflow at 0x%llX (+0x%llX, backing=0x%08X).\n",
+					(unsigned long long)prg_write, (unsigned long long)bytes, prg_size);
+				return 0;
+			}
+			memcpy(ROM + (size_t)prg_write, malloced[p], (size_t)bytes);
+			prg_write += bytes;
 			free(malloced[p]);
 			malloced[p] = 0;
 			mallocedsizes[p] = 0;
 		}
 	}
 
+	if (prg_write != prg_payload) {
+		FCEU_printf(" UNIF PRG payload mismatch: expected 0x%llX, combined 0x%llX.\n",
+			(unsigned long long)prg_payload, (unsigned long long)prg_write);
+		return 0;
+	}
+
 	UNIF_PRGROMSize = prg_size;
 	ROM_size = (uint32)(UNIF_PRGROMSize / 8192);
-	SetupCartPRGMapping(0, ROM, (uint32)UNIF_PRGROMSize, 0);
+	SetupCartPRGMapping(0, ROM, prg_size, 0);
 
-	if (UNIF_CHRROMSize) {
-		chr_size = FixRomSize((uint32)UNIF_CHRROMSize, 8192);
-		if (!(VROM = (uint8*)FCEU_malloc((uint32)chr_size)))
+	if (chr_payload) {
+		if (!FixRomSize(chr_payload, 8192, &chr_size)) {
+			FCEU_printf(" UNIF CHR image is too large to map safely.\n");
 			return 0;
-		memset(VROM, 0xFF, (uint32)chr_size);
+		}
+		if (!(VROM = (uint8*)FCEU_malloc(chr_size)))
+			return 0;
+		memset(VROM, 0xFF, chr_size);
 
 		for (x = 0; x < (int)chr_chip_count; x++) {
 			int c = 16 + chr_idx[x];
 
 			if (malloced[c]) {
-				memcpy(VROM + chr_write, malloced[c], mallocedsizes[c]);
-				chr_write += mallocedsizes[c];
+				const uint64 bytes = mallocedsizes[c];
+				if (chr_write > chr_size || bytes > (uint64)chr_size - chr_write) {
+					FCEU_printf(" UNIF CHR combine overflow at 0x%llX (+0x%llX, backing=0x%08X).\n",
+						(unsigned long long)chr_write, (unsigned long long)bytes, chr_size);
+					return 0;
+				}
+				memcpy(VROM + (size_t)chr_write, malloced[c], (size_t)bytes);
+				chr_write += bytes;
 				free(malloced[c]);
 				malloced[c] = 0;
 				mallocedsizes[c] = 0;
 			}
 		}
 
+		if (chr_write != chr_payload) {
+			FCEU_printf(" UNIF CHR payload mismatch: expected 0x%llX, combined 0x%llX.\n",
+				(unsigned long long)chr_payload, (unsigned long long)chr_write);
+			return 0;
+		}
+
 		UNIF_CHRROMSize = chr_size;
 		VROM_size = (uint32)(UNIF_CHRROMSize / 8192);
-		SetupCartCHRMapping(0, VROM, (uint32)UNIF_CHRROMSize, 0);
+		SetupCartCHRMapping(0, VROM, chr_size, 0);
 	}
 	else {
 		VROM = 0;
@@ -788,7 +968,8 @@ static void UNIFGI(GI h) {
 int UNIFLoad(const char* name, FCEUFILE* fp) {
 
 	FCEU_fseek(fp, 0, SEEK_SET);
-	FCEU_fread(&unhead, 1, 4, fp);
+	if (FCEU_fgetsize(fp) < 0x20 || FCEU_fread(&unhead, 1, 4, fp) != 4)
+		return LOADER_INVALID_FORMAT;
 	if (memcmp(&unhead, "UNIF", 4))
 		return LOADER_INVALID_FORMAT;
 
@@ -852,6 +1033,7 @@ int UNIFLoad(const char* name, FCEUFILE* fp) {
 	strcpy(LoadedRomFName, name); //For the debugger list
 	GameInterface = UNIFGI;
 	currCartInfo = &UNIFCart;
+	UNIF_ImageLoaded = 1;
 	return LOADER_OK;
 }
 
